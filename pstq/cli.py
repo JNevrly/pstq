@@ -6,24 +6,29 @@
 """
 
 import sys
-import pkg_resources
+from importlib.resources import files
+
 import click
-from onacol import ConfigManager, ConfigValidationError
+from onacol import ConfigManager, ConfigValidationError  # type: ignore[import-untyped]
+
+DEFAULT_CONFIG_FILE = str(files("pstq").joinpath("default_config.yaml"))
 
 
-DEFAULT_CONFIG_FILE = pkg_resources.resource_filename(
-    "pstq", "default_config.yaml")
-
-
-
-@click.command(context_settings=dict(
-    ignore_unknown_options=True,
-    allow_extra_args=True
-))
-@click.option("--config", type=click.Path(exists=True), default=None,
-              help="Path to the configuration file.")
-@click.option("--get-config-template", type=click.File("w"), default=None,
-              help="Write default configuration template to the file.")
+@click.command(
+    context_settings=dict(ignore_unknown_options=True, allow_extra_args=True)
+)
+@click.option(
+    "--config",
+    type=click.Path(exists=True),
+    default=None,
+    help="Path to the configuration file.",
+)
+@click.option(
+    "--get-config-template",
+    type=click.File("w"),
+    default=None,
+    help="Write default configuration template to the file.",
+)
 @click.pass_context
 def main(ctx, config, get_config_template):
     """Console script for pstq."""
@@ -31,7 +36,7 @@ def main(ctx, config, get_config_template):
     config_manager = ConfigManager(
         DEFAULT_CONFIG_FILE,
         env_var_prefix="pstq",
-        optional_files=[config] if config else []
+        optional_files=[config] if config else [],
     )
 
     # Generate configuration for the --get-config-template option
@@ -50,14 +55,12 @@ def main(ctx, config, get_config_template):
     try:
         config_manager.validate()
     except ConfigValidationError as cve:
-        click.secho("<----------------Configuration problem---------------->",
-                    fg='red')
+        click.secho("<----------------Configuration problem---------------->", fg="red")
         # Logging is not yet configured at this point.
-        click.secho(str(cve), fg='red', err=True)
+        click.secho(str(cve), fg="red", err=True)
         sys.exit(1)
 
-    click.echo("Replace this message by putting your code into "
-               "pstq.cli.main")
+    click.echo("Replace this message by putting your code into pstq.cli.main")
     click.echo("See click documentation at https://click.palletsprojects.com/")
     sys.exit(0)
 
