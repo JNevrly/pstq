@@ -756,6 +756,210 @@ def test_import_pst_renders_html_with_safe_image_markers(tmp_path: Path) -> None
     ]
 
 
+def test_recovered_cid_image_uses_a_canonical_source_attachment(tmp_path: Path) -> None:
+    attachment = PstAttachment(
+        index=0,
+        filename="photo.png",
+        mime_type="image/png",
+        size=20,
+        content_id="<photo@example.test>",
+        content_location=None,
+        attachment_method=1,
+        hidden=True,
+        rendering_position=0,
+    )
+    FakeReader.folders = _records(
+        _message(
+            plain_text_body=None,
+            html_body=(
+                "<p>Current</p><p>-----Original Message-----</p>"
+                "<p>From: Owner &lt;owner@example.test&gt;</p>"
+                "<p>Sent: 20.08.2026 10:00</p><p>To: Recipient</p>"
+                "<p>Subject: Status</p>"
+                "<p><img src='CID:&lt;PHOTO@EXAMPLE.TEST&gt;'></p>"
+            ),
+            attachments=(attachment,),
+        )
+    )
+    database_path = tmp_path / "index.sqlite"
+    output_path = tmp_path / "photo.png"
+    history = index.HistorySettings(("owner@example.test",), (), "UTC")
+
+    index.import_pst("archive.pst", database_path, history)
+
+    recovered = index.search_messages(database_path, "attachment")
+    assert len(recovered) == 1
+    assert index.get_message(database_path, recovered[0].id)["body"] == (
+        "[attachment: store:3:0]"
+    )
+    assert index.list_attachments(database_path, recovered[0].id) == []
+    assert index.extract_attachment(
+        "archive.pst", database_path, "store:3:0", output_path, history
+    ) == len(b"anonymous attachment")
+    assert output_path.read_bytes() == b"anonymous attachment"
+
+
+@pytest.mark.parametrize(
+    "attachments",
+    [
+        (
+            PstAttachment(
+                0,
+                "photo@example.test",
+                "image/png",
+                20,
+                None,
+                "photo@example.test",
+                1,
+                True,
+                0,
+            ),
+        ),
+        (
+            PstAttachment(
+                0,
+                "photo.png",
+                "image/png",
+                20,
+                "<photo@example.test>",
+                None,
+                1,
+                True,
+                0,
+            ),
+            PstAttachment(
+                1,
+                "photo-copy.png",
+                "image/png",
+                20,
+                "PHOTO@EXAMPLE.TEST",
+                None,
+                1,
+                True,
+                1,
+            ),
+        ),
+    ],
+)
+def test_recovered_cid_image_requires_unambiguous_content_id(
+    tmp_path: Path, attachments: tuple[PstAttachment, ...]
+) -> None:
+    html_body = (
+        "<p>Current</p><p>-----Original Message-----</p>"
+        "<p>From: Owner &lt;owner@example.test&gt;</p>"
+        "<p>Sent: 20.08.2026 10:00</p><p>To: Recipient</p><p>Subject: Status</p>"
+        "<p><img src='cid:&lt;photo@example.test&gt;'></p>"
+    )
+    FakeReader.folders = _records(
+        _message(
+            nid=3, plain_text_body=None, html_body=html_body, attachments=attachments
+        )
+    )
+    database_path = tmp_path / "index.sqlite"
+
+    index.import_pst(
+        "archive.pst",
+        database_path,
+        index.HistorySettings(("owner@example.test",), (), "UTC"),
+    )
+
+    recovered = index.search_messages(database_path, "unresolved")
+    assert len(recovered) == 1
+    assert index.get_message(database_path, recovered[0].id)["body"] == (
+        "[image: unresolved cid:<photo@example.test>]"
+    )
+
+
+def test_recovered_cid_image_uses_only_the_lowest_nid_canonical_source(
+    tmp_path: Path,
+) -> None:
+    html_body = (
+        "<p>Current</p><p>-----Original Message-----</p>"
+        "<p>From: Owner &lt;owner@example.test&gt;</p>"
+        "<p>Sent: 20.08.2026 10:00</p><p>To: Recipient</p><p>Subject: Status</p>"
+        "<p><img src='cid:photo@example.test'></p>"
+    )
+    attachment = PstAttachment(
+        0, "photo.png", "image/png", 20, "<photo@example.test>", None, 1, True, 0
+    )
+    FakeReader.folders = _records(
+        _message(nid=3, plain_text_body=None, html_body=html_body),
+        _message(
+            nid=4, plain_text_body=None, html_body=html_body, attachments=(attachment,)
+        ),
+    )
+    database_path = tmp_path / "index.sqlite"
+
+    index.import_pst(
+        "archive.pst",
+        database_path,
+        index.HistorySettings(("owner@example.test",), (), "UTC"),
+    )
+
+    recovered = index.search_messages(database_path, "unresolved")
+    assert len(recovered) == 1
+    assert index.get_message(database_path, recovered[0].id)["body"] == (
+        "[image: unresolved cid:photo@example.test]"
+    )
+
+
+def test_sync_rebuilds_recovered_cid_images_when_attachments_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = [index._SourceState("archive.pst", 1, 1)]
+    monkeypatch.setattr(index, "_source_state", lambda _: source[0])
+    html_body = (
+        "<p>Current</p><p>-----Original Message-----</p>"
+        "<p>From: Owner &lt;owner@example.test&gt;</p>"
+        "<p>Sent: 20.08.2026 10:00</p><p>To: Recipient</p><p>Subject: Status</p>"
+        "<p><img src='cid:photo@example.test'></p>"
+    )
+    history = index.HistorySettings(("owner@example.test",), (), "UTC")
+    database_path = tmp_path / "index.sqlite"
+    matching = PstAttachment(
+        0, "photo.png", "image/png", 20, "<photo@example.test>", None, 1, True, 0
+    )
+    changed = PstAttachment(
+        0, "photo.png", "image/png", 20, "<other@example.test>", None, 1, True, 0
+    )
+    FakeReader.folders = _records(
+        _message(
+            nid=3, plain_text_body=None, html_body=html_body, attachments=(matching,)
+        )
+    )
+    index.import_pst("archive.pst", database_path, history)
+    recovered_id = index.search_messages(database_path, "attachment")[0].id
+
+    source[0] = index._SourceState("archive.pst", 2, 2)
+    FakeReader.folders = _records(
+        _message(
+            nid=3,
+            plain_text_body=None,
+            html_body=html_body,
+            attachments=(changed,),
+            modification_time=datetime(2026, 8, 21, 12, 30),
+        )
+    )
+    result = index.sync_pst("archive.pst", database_path, history)
+
+    assert result.full is False
+    assert index.get_message(database_path, recovered_id)["body"] == (
+        "[image: unresolved cid:photo@example.test]"
+    )
+
+    FakeReader.folders = _records(
+        _message(
+            nid=3, plain_text_body=None, html_body=html_body, attachments=(matching,)
+        )
+    )
+    result = index.sync_pst("archive.pst", database_path, history, full=True)
+
+    assert result.full is True
+    assert index.get_message(database_path, recovered_id)["body"] == (
+        "[attachment: store:3:0]"
+    )
+
+
 def test_html_renderer_handles_empty_and_block_tags() -> None:
     assert index._render_body("<div>A<br>B</div><style>x</style>", "html", {}) == "A\nB"
     assert index._render_body(b"<p>Bytes</p>", "html", {}) == "Bytes"

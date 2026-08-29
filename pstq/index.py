@@ -30,12 +30,13 @@ from pstq.body import (
 from pstq.pst import PstAttachment, PstFolder, PstMessage, PstReader
 
 SCHEMA_VERSION = 9
-CLEANER_VERSION = 3
+CLEANER_VERSION = 4
 
 _ORIGINAL_MESSAGE_SEPARATOR = re.compile(
     r"^-----Original Message-----\s*$", re.IGNORECASE
 )
 _MESSAGE_ID = re.compile(r"<[^<>\s@]+@[^<>\s@]+>")
+_UNRESOLVED_CID_IMAGE = re.compile(r"\[image: unresolved cid:([^\]]*)\]")
 _HTML_BLOCK_TAGS = frozenset(
     {"address", "blockquote", "br", "div", "hr", "li", "p", "pre", "tr"}
 )
@@ -1313,6 +1314,13 @@ def _normalize_content_id(value: str) -> str:
     return value.strip().strip("<>").casefold()
 
 
+def _resolve_quoted_cid_images(body: str, attachment_ids: dict[str, str]) -> str:
+    """Replace quoted CID placeholders only when the canonical source is unique."""
+    return _UNRESOLVED_CID_IMAGE.sub(
+        lambda match: _image_marker(f"cid:{match.group(1)}", attachment_ids), body
+    )
+
+
 def _bounded(value: str, limit: int = 120) -> str:
     return value if len(value) <= limit else f"{value[:limit]}..."
 
@@ -1807,13 +1815,25 @@ def _index_recovered_messages(connection: sqlite3.Connection, store_uid: str) ->
         fingerprints.add(fingerprint)
         sender = _sqlite_optional_text(row[1])
         sender_email = _sqlite_optional_text(row[2])
+        canonical_source_nid = cast(int, row[7])
+        body = _resolve_quoted_cid_images(
+            _sqlite_optional_text(row[6]) or "",
+            _attachment_ids_for_message(connection, store_uid, canonical_source_nid),
+        )
+        connection.execute(
+            """
+            UPDATE recovered_message SET body = ?
+            WHERE store_uid = ? AND fingerprint = ?
+            """,
+            (body, store_uid, fingerprint),
+        )
         _upsert_search_document(
             connection,
             store_uid,
             _recovered_record_id(store_uid, fingerprint),
             native_nid=None,
             recovered_fingerprint=fingerprint,
-            canonical_source_nid=cast(int, row[7]),
+            canonical_source_nid=canonical_source_nid,
             folder_nid=cast(int, row[9]),
             folder_path=cast(str, row[10]),
             date=_sqlite_optional_text(row[5]),
@@ -1822,8 +1842,37 @@ def _index_recovered_messages(connection: sqlite3.Connection, store_uid: str) ->
             recipients=tuple(json.loads(_sqlite_optional_text(row[3]) or "[]")),
             subject=_sqlite_optional_text(row[4]),
             has_attachment=False,
-            body=_sqlite_optional_text(row[6]),
+            body=body,
         )
+
+
+def _attachment_ids_for_message(
+    connection: sqlite3.Connection, store_uid: str, message_nid: int
+) -> dict[str, str]:
+    """Return only unambiguous normalized CID attachment selectors for a message."""
+    rows = connection.execute(
+        """
+        SELECT content_id, index_in_message FROM attachment
+        WHERE store_uid = ? AND message_nid = ?
+        """,
+        (store_uid, message_nid),
+    ).fetchall()
+    attachment_ids: dict[str, str | None] = {}
+    for content_id, attachment_index in rows:
+        normalized = _normalize_content_id(_sqlite_optional_text(content_id) or "")
+        if not normalized:
+            continue
+        if normalized in attachment_ids:
+            attachment_ids[normalized] = None
+            continue
+        attachment_ids[normalized] = _attachment_id(
+            store_uid, message_nid, cast(int, attachment_index)
+        )
+    return {
+        content_id: attachment_id
+        for content_id, attachment_id in attachment_ids.items()
+        if attachment_id is not None
+    }
 
 
 def _header_sender_email(headers: str | None) -> str | None:
