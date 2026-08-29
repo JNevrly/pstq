@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -13,20 +14,27 @@ from datetime import UTC, datetime
 from email import policy
 from email.parser import HeaderParser
 from email.utils import getaddresses
+from hashlib import sha256
 from html.parser import HTMLParser
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import cast
 
+from pstq.body import (
+    ANALYZER_VERSION,
+    QuotedMessage,
+    analyze_body,
+    is_owner,
+    native_fingerprint,
+)
 from pstq.pst import PstAttachment, PstFolder, PstMessage, PstReader
 
-SCHEMA_VERSION = 6
-CLEANER_VERSION = 2
+SCHEMA_VERSION = 7
+CLEANER_VERSION = 3
 
 _ORIGINAL_MESSAGE_SEPARATOR = re.compile(
     r"^-----Original Message-----\s*$", re.IGNORECASE
 )
-_OUTLOOK_HEADER = re.compile(r"^(From|Sent|To|Cc|Subject):\s+\S.*", re.IGNORECASE)
 _MESSAGE_ID = re.compile(r"<[^<>\s@]+@[^<>\s@]+>")
 _HTML_BLOCK_TAGS = frozenset(
     {"address", "blockquote", "br", "div", "hr", "li", "p", "pre", "tr"}
@@ -146,15 +154,36 @@ class _IndexState:
     schema_version: int
     cleaner_version: int
     generation: int
+    history_fingerprint: str = ""
 
 
-def import_pst(source_path: str | Path, database_path: str | Path) -> ImportResult:
+@dataclass(frozen=True)
+class HistorySettings:
+    """Explicit archive-owner context for quoted-history recovery."""
+
+    owner_emails: tuple[str, ...] = ()
+    owner_names: tuple[str, ...] = ()
+    timezone: str = "UTC"
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.owner_emails or self.owner_names)
+
+
+DEFAULT_HISTORY_SETTINGS = HistorySettings()
+
+
+def import_pst(
+    source_path: str | Path,
+    database_path: str | Path,
+    history: HistorySettings = DEFAULT_HISTORY_SETTINGS,
+) -> ImportResult:
     """Build DATABASE_PATH from SOURCE_PATH without risking its current contents."""
     source = _source_state(source_path)
     target = Path(database_path)
     temporary_path = _temporary_database_path(target)
     try:
-        result = _write_index(source_path, temporary_path, source)
+        result = _write_index(source_path, temporary_path, source, history)
         os.replace(temporary_path, target)
         return result
     except Exception:
@@ -163,7 +192,11 @@ def import_pst(source_path: str | Path, database_path: str | Path) -> ImportResu
 
 
 def sync_pst(
-    source_path: str | Path, database_path: str | Path, *, full: bool = False
+    source_path: str | Path,
+    database_path: str | Path,
+    history: HistorySettings = DEFAULT_HISTORY_SETTINGS,
+    *,
+    full: bool = False,
 ) -> SyncResult:
     """Synchronize DATABASE_PATH with SOURCE_PATH without replacing a usable cache.
 
@@ -173,15 +206,16 @@ def sync_pst(
     """
     target = Path(database_path)
     if full or not target.is_file():
-        return _full_sync(source_path, target)
+        return _full_sync(source_path, target, history)
 
     state = _read_index_state(target)
     if (
         state is None
         or state.schema_version != SCHEMA_VERSION
         or state.cleaner_version != CLEANER_VERSION
+        or state.history_fingerprint != _history_fingerprint(history)
     ):
-        return _full_sync(source_path, target)
+        return _full_sync(source_path, target, history)
 
     source = _source_state(source_path)
     if source == state.source:
@@ -198,12 +232,14 @@ def sync_pst(
             full=False,
         )
 
-    result = _incremental_sync(source_path, target, source, state)
-    return result if result is not None else _full_sync(source_path, target)
+    result = _incremental_sync(source_path, target, source, state, history)
+    return result if result is not None else _full_sync(source_path, target, history)
 
 
 def index_status(
-    source_path: str | Path, database_path: str | Path
+    source_path: str | Path,
+    database_path: str | Path,
+    history: HistorySettings = DEFAULT_HISTORY_SETTINGS,
 ) -> dict[str, object]:
     """Return source and cache metadata without opening the PST reader."""
     source_path = str(Path(source_path).resolve())
@@ -222,6 +258,7 @@ def index_status(
             and state is not None
             and state.schema_version == SCHEMA_VERSION
             and state.cleaner_version == CLEANER_VERSION
+            and state.history_fingerprint == _history_fingerprint(history)
             and state.source == source
         ),
         "index_exists": Path(database_path).is_file(),
@@ -429,12 +466,29 @@ def get_thread(database_path: str | Path, message_id: str) -> dict[str, object]:
         recipients = _recipients_for_messages(
             connection, store_uid, tuple((row[0],) for row in rows)
         )
-    rows.sort(key=_thread_order)
+        recovered_rows = connection.execute(
+            f"""
+            SELECT recovered_message.fingerprint, recovered_message.sender,
+                   recovered_message.sender_email, recovered_message.recipients_json,
+                   recovered_message.subject, recovered_message.sent_at,
+                   recovered_message.sent_raw, recovered_message.body,
+                   recovered_message.relation, quote_occurrence.source_message_nid
+            FROM recovered_message
+            JOIN quote_occurrence
+              ON quote_occurrence.store_uid = recovered_message.store_uid
+             AND quote_occurrence.recovered_fingerprint = recovered_message.fingerprint
+            WHERE recovered_message.store_uid = ?
+              AND quote_occurrence.source_message_nid IN ({placeholders})
+            ORDER BY recovered_message.fingerprint, quote_occurrence.source_message_nid
+            """,
+            (store_uid, *nids),
+        ).fetchall()
+    records = [_message_record(store_uid, row, recipients[row[0]]) for row in rows]
+    records.extend(_recovered_records(store_uid, recovered_rows))
+    records.sort(key=_record_order)
     return {
         "id": message_id,
-        "messages": [
-            _message_record(store_uid, row, recipients[row[0]]) for row in rows
-        ],
+        "messages": records,
     }
 
 
@@ -509,10 +563,11 @@ def extract_attachment(
     database_path: str | Path,
     attachment_id: str,
     output_path: str | Path,
+    history: HistorySettings = DEFAULT_HISTORY_SETTINGS,
 ) -> int:
     """Extract one persisted attachment through a cached traversal locator."""
     store_uid, message_nid, attachment_index = _parse_attachment_id(attachment_id)
-    sync_pst(source_path, database_path)
+    sync_pst(source_path, database_path, history)
     state = _require_index_state(database_path)
     if store_uid != state.store_uid:
         raise ValueError(
@@ -587,8 +642,10 @@ def _message_locator(
     return tuple(reversed(folder_indexes)), row[1]
 
 
-def _full_sync(source_path: str | Path, target: Path) -> SyncResult:
-    result = import_pst(source_path, target)
+def _full_sync(
+    source_path: str | Path, target: Path, history: HistorySettings
+) -> SyncResult:
+    result = import_pst(source_path, target, history)
     return SyncResult(
         result.store_uid,
         result.folder_count,
@@ -607,6 +664,7 @@ def _incremental_sync(
     target: Path,
     source: _SourceState,
     state: _IndexState,
+    history: HistorySettings,
 ) -> SyncResult | None:
     temporary_path = _temporary_database_path(target)
     try:
@@ -654,8 +712,9 @@ def _incremental_sync(
                 """,
                 (store_uid, generation),
             )
+            _rebuild_recovered_messages(connection, store_uid, history)
             _assert_source_unchanged(source)
-            _write_index_state(connection, source, store_uid, generation)
+            _write_index_state(connection, source, store_uid, generation, history)
             folder_count, message_count = _cache_counts(connection, store_uid)
 
         os.replace(temporary_path, target)
@@ -757,7 +816,10 @@ def _load_changed_bodies(
 
 
 def _write_index(
-    source_path: str | Path, database_path: Path, source: _SourceState
+    source_path: str | Path,
+    database_path: Path,
+    source: _SourceState,
+    history: HistorySettings,
 ) -> ImportResult:
     connection = sqlite3.connect(database_path)
     try:
@@ -774,7 +836,10 @@ def _write_index(
                     _upsert_message(connection, store_uid, message, generation=1)
                     message_count += 1
             _assert_source_unchanged(source)
-            _write_index_state(connection, source, store_uid, generation=1)
+            _rebuild_recovered_messages(connection, store_uid, history)
+            _write_index_state(
+                connection, source, store_uid, generation=1, history=history
+            )
     finally:
         connection.close()
     return ImportResult(store_uid, folder_count, message_count)
@@ -795,6 +860,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             store_uid TEXT NOT NULL REFERENCES store(uid),
             schema_version INTEGER NOT NULL,
             cleaner_version INTEGER NOT NULL,
+            history_fingerprint TEXT NOT NULL,
             last_successful_sync TEXT NOT NULL,
             generation INTEGER NOT NULL
         );
@@ -860,6 +926,34 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             rendering_position INTEGER,
             PRIMARY KEY (store_uid, message_nid, index_in_message),
             FOREIGN KEY (store_uid, message_nid) REFERENCES message(store_uid, nid)
+        );
+
+        CREATE TABLE recovered_message (
+            store_uid TEXT NOT NULL REFERENCES store(uid),
+            fingerprint TEXT NOT NULL,
+            sender TEXT NOT NULL,
+            sender_email TEXT,
+            recipients_json TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            sent_at TEXT,
+            sent_raw TEXT NOT NULL,
+            body TEXT NOT NULL,
+            relation TEXT NOT NULL,
+            PRIMARY KEY (store_uid, fingerprint)
+        );
+
+        CREATE TABLE quote_occurrence (
+            store_uid TEXT NOT NULL,
+            source_message_nid INTEGER NOT NULL,
+            recovered_fingerprint TEXT NOT NULL,
+            quote_index INTEGER NOT NULL,
+            PRIMARY KEY (
+                store_uid, source_message_nid, recovered_fingerprint, quote_index
+            ),
+            FOREIGN KEY (store_uid, source_message_nid)
+                REFERENCES message(store_uid, nid) ON DELETE CASCADE,
+            FOREIGN KEY (store_uid, recovered_fingerprint)
+                REFERENCES recovered_message(store_uid, fingerprint) ON DELETE CASCADE
         );
 
         CREATE VIRTUAL TABLE message_fts USING fts5(
@@ -1015,7 +1109,8 @@ def _read_status_state(database_path: Path) -> tuple[_IndexState | None, str | N
             row = connection.execute(
                 """
                 SELECT source_path, source_size, source_mtime_ns, store_uid,
-                       schema_version, cleaner_version, generation, last_successful_sync
+                       schema_version, cleaner_version, history_fingerprint, generation,
+                       last_successful_sync
                 FROM index_state WHERE singleton = 1
                 """
             ).fetchone()
@@ -1025,9 +1120,9 @@ def _read_status_state(database_path: Path) -> tuple[_IndexState | None, str | N
         return None, None
     return (
         _IndexState(
-            _SourceState(row[0], row[1], row[2]), row[3], row[4], row[5], row[6]
+            _SourceState(row[0], row[1], row[2]), row[3], row[4], row[5], row[7], row[6]
         ),
-        row[7],
+        row[8],
     )
 
 
@@ -1036,13 +1131,15 @@ def _write_index_state(
     source: _SourceState,
     store_uid: str,
     generation: int,
+    history: HistorySettings,
 ) -> None:
     connection.execute(
         """
         INSERT INTO index_state (
             singleton, source_path, source_size, source_mtime_ns, store_uid,
-            schema_version, cleaner_version, last_successful_sync, generation
-        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+            schema_version, cleaner_version, history_fingerprint, last_successful_sync,
+            generation
+        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(singleton) DO UPDATE SET
             source_path = excluded.source_path,
             source_size = excluded.source_size,
@@ -1050,6 +1147,7 @@ def _write_index_state(
             store_uid = excluded.store_uid,
             schema_version = excluded.schema_version,
             cleaner_version = excluded.cleaner_version,
+            history_fingerprint = excluded.history_fingerprint,
             last_successful_sync = excluded.last_successful_sync,
             generation = excluded.generation
         """,
@@ -1060,6 +1158,7 @@ def _write_index_state(
             store_uid,
             SCHEMA_VERSION,
             CLEANER_VERSION,
+            _history_fingerprint(history),
             datetime.now(UTC).isoformat(),
             generation,
         ),
@@ -1099,10 +1198,13 @@ def clean_body(body: str | bytes | None) -> str | None:
         return None
     if isinstance(body, bytes):
         body = _decode_sqlite_text(body)
+    analysis = analyze_body(body, "UTC")
+    if analysis.quoted_messages:
+        return analysis.authored_body
     lines = body.splitlines(keepends=True)
     for index, line in enumerate(lines):
         is_separator = _ORIGINAL_MESSAGE_SEPARATOR.fullmatch(line.strip())
-        if is_separator or _is_outlook_header_block(lines, index):
+        if is_separator:
             return "".join(lines[:index])
     return body
 
@@ -1143,26 +1245,6 @@ def _normalize_content_id(value: str) -> str:
 
 def _bounded(value: str, limit: int = 120) -> str:
     return value if len(value) <= limit else f"{value[:limit]}..."
-
-
-def _is_outlook_header_block(lines: list[str], start: int) -> bool:
-    """Recognize the ordered, populated English Outlook reply header block."""
-    expected = iter(("from", "sent", "to"))
-    for label in expected:
-        if start >= len(lines):
-            return False
-        match = _OUTLOOK_HEADER.fullmatch(lines[start].strip())
-        if match is None or match[1].casefold() != label:
-            return False
-        start += 1
-    if start < len(lines):
-        match = _OUTLOOK_HEADER.fullmatch(lines[start].strip())
-        if match is not None and match[1].casefold() == "cc":
-            start += 1
-    if start >= len(lines):
-        return False
-    match = _OUTLOOK_HEADER.fullmatch(lines[start].strip())
-    return match is not None and match[1].casefold() == "subject"
 
 
 def _relationships(headers: str | None) -> dict[str, str | None]:
@@ -1289,6 +1371,60 @@ def _thread_order(row: Sequence[object]) -> tuple[int, datetime, int]:
     return (1, datetime.max, cast(int, row[0]))
 
 
+def _recovered_records(
+    store_uid: str, rows: Sequence[Sequence[object]]
+) -> list[dict[str, object]]:
+    records: dict[str, dict[str, object]] = {}
+    for row in rows:
+        fingerprint = _sqlite_optional_text(row[0])
+        assert fingerprint is not None
+        record = records.setdefault(
+            fingerprint,
+            {
+                "attachment_count": 0,
+                "body": _sqlite_optional_text(row[7]),
+                "body_format": "quoted",
+                "client_submit_time": _sqlite_optional_text(row[5]),
+                "conversation_index": None,
+                "conversation_topic": None,
+                "date": _sqlite_optional_text(row[5]),
+                "date_raw": _sqlite_optional_text(row[6]),
+                "delivery_time": None,
+                "folder": None,
+                "folder_id": None,
+                "from": _sqlite_optional_text(row[1]),
+                "id": f"{store_uid}:q:{fingerprint}",
+                "in_reply_to": None,
+                "internet_message_id": None,
+                "modification_time": None,
+                "provenance": {"source_message_ids": []},
+                "record_type": "recovered",
+                "references": None,
+                "relation": _sqlite_optional_text(row[8]),
+                "subject": _sqlite_optional_text(row[4]),
+                "to": json.loads(_sqlite_optional_text(row[3]) or "[]"),
+                "transport_headers": None,
+            },
+        )
+        sources = cast(dict[str, list[str]], record["provenance"])["source_message_ids"]
+        sources.append(_record_id(store_uid, cast(int, row[9])))
+    return list(records.values())
+
+
+def _record_order(record: dict[str, object]) -> tuple[int, datetime, str]:
+    value = cast(str | None, record["date"])
+    if value is not None:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            pass
+        else:
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(UTC).replace(tzinfo=None)
+            return (0, parsed, cast(str, record["id"]))
+    return (1, datetime.max, cast(str, record["id"]))
+
+
 def _replace_recipients(
     connection: sqlite3.Connection,
     store_uid: str,
@@ -1384,6 +1520,103 @@ def _index_message(connection: sqlite3.Connection, store_uid: str, nid: int) -> 
         """,
         row,
     )
+
+
+def _rebuild_recovered_messages(
+    connection: sqlite3.Connection, store_uid: str, history: HistorySettings
+) -> None:
+    """Recreate derived quote records from native bodies in this transaction."""
+    connection.execute("DELETE FROM quote_occurrence WHERE store_uid = ?", (store_uid,))
+    connection.execute(
+        "DELETE FROM recovered_message WHERE store_uid = ?", (store_uid,)
+    )
+    if not history.enabled:
+        return
+    owner_emails = frozenset(value.strip().casefold() for value in history.owner_emails)
+    owner_names = frozenset(_normalized_name(value) for value in history.owner_names)
+    native_rows = connection.execute(
+        """
+        SELECT nid, sender_name, subject, client_submit_time, delivery_time,
+               transport_headers, body_raw, body_clean, body_format
+        FROM message WHERE store_uid = ?
+        """,
+        (store_uid,),
+    ).fetchall()
+    native_fingerprints = {
+        native_fingerprint(
+            row[1], _header_sender_email(_sqlite_optional_text(row[5])), row[2], row[7]
+        )
+        for row in native_rows
+    }
+    recovered: dict[str, QuotedMessage] = {}
+    occurrences: list[tuple[str, int, str, int]] = []
+    for row in native_rows:
+        rendered = _render_body(row[6], _sqlite_optional_text(row[8]), {})
+        analysis = analyze_body(rendered, history.timezone)
+        for quote in analysis.quoted_messages:
+            if (
+                not quote.body
+                or not is_owner(quote, owner_emails, owner_names)
+                or quote.fingerprint in native_fingerprints
+            ):
+                continue
+            recovered.setdefault(quote.fingerprint, quote)
+            occurrences.append((store_uid, row[0], quote.fingerprint, quote.index))
+    connection.executemany(
+        """
+        INSERT INTO recovered_message (
+            store_uid, fingerprint, sender, sender_email, recipients_json, subject,
+            sent_at, sent_raw, body, relation
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                store_uid,
+                fingerprint,
+                quote.sender,
+                quote.sender_email,
+                json.dumps(quote.recipients),
+                quote.subject,
+                quote.sent_at,
+                quote.sent_raw,
+                quote.body,
+                quote.relation,
+            )
+            for fingerprint, quote in recovered.items()
+        ],
+    )
+    connection.executemany(
+        """
+        INSERT INTO quote_occurrence (
+            store_uid, source_message_nid, recovered_fingerprint, quote_index
+        ) VALUES (?, ?, ?, ?)
+        """,
+        occurrences,
+    )
+
+
+def _header_sender_email(headers: str | None) -> str | None:
+    if headers is None:
+        return None
+    parsed = HeaderParser(policy=policy.default).parsestr(headers)
+    addresses = getaddresses(parsed.get_all("From", ()))
+    return addresses[0][1].casefold() if addresses and addresses[0][1] else None
+
+
+def _history_fingerprint(history: HistorySettings) -> str:
+    values = "\n".join(
+        (
+            str(ANALYZER_VERSION),
+            history.timezone,
+            *sorted(value.strip().casefold() for value in history.owner_emails),
+            *sorted(_normalized_name(value) for value in history.owner_names),
+        )
+    )
+    return sha256(values.encode()).hexdigest()
+
+
+def _normalized_name(value: str) -> str:
+    return " ".join(value.split()).casefold()
 
 
 def _recipients_for_messages(

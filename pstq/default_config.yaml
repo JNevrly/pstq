@@ -12,3 +12,22 @@ archive:
         oc_schema:
             type: string
             nullable: true
+history:
+    # Exact aliases identifying the archive owner in quoted message headers.
+    owner_emails:
+        oc_default: []
+        oc_schema:
+            type: list
+            schema:
+                type: string
+    owner_names:
+        oc_default: []
+        oc_schema:
+            type: list
+            schema:
+                type: string
+    # IANA timezone applied to quoted Outlook timestamps without an offset.
+    timezone:
+        oc_default: UTC
+        oc_schema:
+            type: string

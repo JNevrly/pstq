@@ -27,6 +27,12 @@ file before atomically replacing the index.
 archive:
   pst_path: /archives/mail.pst
   index_path: /var/cache/pstq/mail.sqlite
+history:
+  owner_emails:
+    - user@example.com
+  owner_names:
+    - Example User
+  timezone: Europe/Prague
 ```
 
 Pass the file to every command:
@@ -96,6 +102,17 @@ same selection applies to human-readable and JSON output. The returned record
 includes the selected body representation, body format, participants, folder,
 message headers, relationship metadata, and attachment count.
 
+If the manually curated PST omits Sent Items, configure `history.owner_emails`
+and, where needed, exact display-name `history.owner_names` aliases. During
+synchronization PSTQ conservatively recovers complete Outlook reply and
+forwarded-message blocks in English, Czech, German, and Japanese. `thread`
+then includes high-confidence owner contributions as `record_type: "recovered"`
+records. They include a deterministic `STORE_UID:q:HASH` ID, a relation of
+`reply_history` or `forwarded_context`, and source-message provenance. Recovered
+content is not independently searchable in this release. Ambiguous, edited, or
+incomplete quotation blocks are intentionally omitted. `history.timezone` must
+be an IANA timezone and is applied to quoted timestamps that omit an offset.
+
 ## Command Reference
 
 | Command | Purpose |
@@ -104,7 +121,7 @@ message headers, relationship metadata, and attachment count.
 | `folders [--json]` | List indexed folder paths and stable IDs. |
 | `search QUERY [filters] [--json]` | Synchronize when needed, then run a bounded FTS5 search. |
 | `show MESSAGE_ID [--full] [--json]` | Retrieve one persisted message from SQLite; cleaned body by default. |
-| `thread MESSAGE_ID [--json]` | Reconstruct a related-message view from persisted relationship metadata. |
+| `thread MESSAGE_ID [--json]` | Reconstruct a related-message view and configured owner history from persisted cache data. |
 | `attachments MESSAGE_ID [--json]` | List persisted attachment metadata from SQLite. |
 | `attachment ATTACHMENT_ID --output FILE` | Synchronize if needed, then extract one original attachment through its cached PST locator. |
 

@@ -450,6 +450,93 @@ def test_get_thread_orders_dates_deterministically_and_returns_partial_anchor(
         index.get_thread(database_path, "store:99")
 
 
+def test_thread_includes_deduplicated_owner_history_and_suppresses_native_duplicates(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "index.sqlite"
+    quoted = (
+        "-----Original Message-----\nFrom: Owner <owner@example.test>\n"
+        "Sent: 20.08.2026 10:00\nTo: Recipient <recipient@example.test>\n"
+        "Subject: Re: Status\nRecovered contribution"
+    )
+    FakeReader.folders = _records(
+        _thread_message(
+            10,
+            headers="Message-ID: <root@example.test>",
+            body="Root contribution",
+            delivery_time=datetime(2026, 8, 20, 9),
+        ),
+        _thread_message(
+            11,
+            headers=(
+                "Message-ID: <reply@example.test>\nIn-Reply-To: <root@example.test>"
+            ),
+            body=f"Current reply\n{quoted}",
+            delivery_time=datetime(2026, 8, 20, 11),
+        ),
+        _thread_message(
+            12,
+            headers=(
+                "Message-ID: <later@example.test>\nIn-Reply-To: <root@example.test>"
+            ),
+            body=f"Later reply\n{quoted}",
+            delivery_time=datetime(2026, 8, 20, 12),
+        ),
+    )
+
+    index.import_pst(
+        "archive.pst",
+        database_path,
+        index.HistorySettings(("owner@example.test",), (), "Europe/Prague"),
+    )
+
+    result = index.get_thread(database_path, "store:11")
+
+    recovered_records = [
+        message for message in result["messages"] if "record_type" in message
+    ]
+    assert [message["record_type"] for message in recovered_records] == ["recovered"]
+    recovered = recovered_records[0]
+    assert recovered["body"] == "Recovered contribution"
+    assert recovered["date"] == "2026-08-20T10:00:00+02:00"
+    assert recovered["provenance"] == {"source_message_ids": ["store:11", "store:12"]}
+    assert index.search_messages(database_path, "Recovered") == []
+
+    FakeReader.folders = _records(
+        replace(
+            _thread_message(
+                20,
+                headers=(
+                    "Message-ID: <native@example.test>\n"
+                    "From: Owner <owner@example.test>"
+                ),
+                body="Recovered contribution",
+                delivery_time=datetime(2026, 8, 20, 10),
+            ),
+            subject="Status",
+        ),
+        _thread_message(
+            21,
+            headers=(
+                "Message-ID: <quote@example.test>\nIn-Reply-To: <native@example.test>"
+            ),
+            body=f"Current reply\n{quoted}",
+            delivery_time=datetime(2026, 8, 20, 11),
+        ),
+    )
+    index.import_pst(
+        "archive.pst",
+        database_path,
+        index.HistorySettings(("owner@example.test",), (), "Europe/Prague"),
+    )
+
+    messages = index.get_thread(database_path, "store:21")["messages"]
+    assert [message["id"] for message in messages] == [
+        "store:20",
+        "store:21",
+    ]
+
+
 def test_thread_parsers_ignore_malformed_values() -> None:
     assert index._thread_index("not base64") is None
     assert index._conversation_root("zz" * 22) is None
@@ -458,6 +545,16 @@ def test_thread_parsers_ignore_malformed_values() -> None:
         datetime.max,
         1,
     )
+    assert index._thread_order(
+        (1, None, None, None, None, "2026-08-20T12:00:00+02:00", None)
+    ) == (0, datetime(2026, 8, 20, 10), 1)
+    assert index._record_order({"date": "bad", "id": "store:q:x"}) == (
+        1,
+        datetime.max,
+        "store:q:x",
+    )
+    assert index._header_sender_email(None) is None
+    assert index._normalized_name(" Owner  Name ") == "owner name"
 
 
 @pytest.mark.parametrize(
@@ -847,6 +944,33 @@ def test_sync_pst_rebuilds_when_the_cleaner_version_changes(
     ]
     assert _rows(database_path, "SELECT cleaner_version FROM index_state") == [
         (index.CLEANER_VERSION,)
+    ]
+
+
+def test_sync_pst_rebuilds_derived_history_when_owner_context_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = [index._SourceState("archive.pst", 1, 1)]
+    monkeypatch.setattr(index, "_source_state", lambda _: source[0])
+    database_path = tmp_path / "index.sqlite"
+    FakeReader.folders = _records(
+        _message(
+            plain_text_body=(
+                "Current\nFrom: Owner <owner@example.test>\n"
+                "Sent: 20.08.2026 10:00\nTo: Recipient\nSubject: Status\nRecovered"
+            )
+        )
+    )
+    owner_history = index.HistorySettings(("owner@example.test",), (), "UTC")
+    index.import_pst("archive.pst", database_path, owner_history)
+    FakeReader.walk_arguments = []
+
+    result = index.sync_pst("archive.pst", database_path, index.HistorySettings())
+
+    assert result.full is True
+    assert _rows(database_path, "SELECT * FROM recovered_message") == []
+    assert FakeReader.walk_arguments == [
+        {"include_bodies": True, "include_body_nids": None}
     ]
 
 

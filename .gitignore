@@ -98,6 +98,7 @@ alabaster
 
 .vscode/
 .idea/
+.claude/
 
 # temporary files
 temp/

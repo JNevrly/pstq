@@ -13,6 +13,8 @@ import click
 from onacol import ConfigManager, ConfigValidationError  # type: ignore[import-untyped]
 
 from pstq.index import (
+    DEFAULT_HISTORY_SETTINGS,
+    HistorySettings,
     PstSynchronizationError,
     extract_attachment,
     get_message,
@@ -111,7 +113,9 @@ def main(ctx: click.Context, config: str | None, get_config_template: Any) -> No
 
     Configuration:
       Set archive.pst_path and archive.index_path in --config FILE, or set
-      PSTQ_ARCHIVE__PST_PATH and PSTQ_ARCHIVE__INDEX_PATH. Exactly one PST and
+      PSTQ_ARCHIVE__PST_PATH and PSTQ_ARCHIVE__INDEX_PATH. Optional history
+      owner aliases and timezone control quoted-owner recovery in thread. Exactly
+      one PST and
       one SQLite cache are configured per invocation. The index directory must
       already exist: synchronization creates a sibling temporary database and
       atomically replaces the cache only after a successful source check.
@@ -260,7 +264,7 @@ def status(ctx: click.Context, json_output: bool) -> None:
     synchronizes and can report a missing or unreadable source in source_error.
     """
     source_path, database_path = _configured_paths(ctx)
-    report = index_status(source_path, database_path)
+    report = index_status(source_path, database_path, _history_settings(ctx))
     if json_output:
         click.echo(_json(report), nl=False)
         return
@@ -348,7 +352,11 @@ def search(
     """
     source_path, database_path = _configured_paths(ctx)
     try:
-        sync_pst(source_path, database_path)
+        history = _history_settings(ctx)
+        if history == DEFAULT_HISTORY_SETTINGS:
+            sync_pst(source_path, database_path)
+        else:
+            sync_pst(source_path, database_path, history)
         values = search_messages(
             database_path,
             query,
@@ -425,14 +433,16 @@ def show(
 @click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
 @click.pass_context
 def thread(ctx: click.Context, message_id: str, json_output: bool) -> None:
-    """Display related cached messages as separate cleaned contributions.
+    """Display related cached and recovered messages as separate contributions.
 
     MESSAGE_ID is a STORE_UID:NID. --json returns {id, messages}, where id is
     the requested selector and messages is a chronological array of the same
-    message schema returned by show (with the cleaned body). Relationships use
-    persisted Internet headers and Outlook conversation metadata; absent or
-    inconsistent metadata can leave a thread incomplete. This command reads
-    SQLite only and does not open or synchronize the PST.
+    message schema returned by show (with the cleaned body). Configured
+    owner-history recovery may add records with record_type "recovered",
+    provenance, and relation. Relationships use persisted Internet headers and
+    Outlook conversation metadata; absent or inconsistent metadata can leave a
+    thread incomplete. This command reads SQLite only and does not open or
+    synchronize the PST.
     """
     _, database_path = _configured_paths(ctx)
     try:
@@ -509,7 +519,15 @@ def attachment(ctx: click.Context, attachment_id: str, output: str) -> None:
     """
     source_path, database_path = _configured_paths(ctx)
     try:
-        written = extract_attachment(source_path, database_path, attachment_id, output)
+        history = _history_settings(ctx)
+        if history == DEFAULT_HISTORY_SETTINGS:
+            written = extract_attachment(
+                source_path, database_path, attachment_id, output
+            )
+        else:
+            written = extract_attachment(
+                source_path, database_path, attachment_id, output, history
+            )
     except (OSError, PstReaderError, PstSynchronizationError, ValueError) as error:
         raise _command_error(error) from error
     click.echo(f"Wrote {written} bytes to {output}")
@@ -527,6 +545,32 @@ def _configured_paths(ctx: click.Context) -> tuple[str, str]:
             "configuration_error",
         )
     return str(Path(source_path)), str(Path(database_path))
+
+
+def _history_settings(ctx: click.Context) -> HistorySettings:
+    config = cast(dict[str, object], ctx.obj)
+    history = cast(dict[str, object], config.get("history", {}))
+    emails = history.get("owner_emails", ())
+    names = history.get("owner_names", ())
+    timezone = history.get("timezone", "UTC")
+    if (
+        not isinstance(emails, list)
+        or not all(isinstance(value, str) for value in emails)
+        or not isinstance(names, list)
+        or not all(isinstance(value, str) for value in names)
+        or not isinstance(timezone, str)
+    ):
+        raise CliContractError("Invalid history configuration.", "configuration_error")
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    try:
+        ZoneInfo(timezone)
+    except ZoneInfoNotFoundError as error:
+        raise CliContractError(
+            f"history.timezone is not an IANA timezone: {timezone}",
+            "configuration_error",
+        ) from error
+    return HistorySettings(tuple(emails), tuple(names), timezone)
 
 
 def _json(value: Any) -> str:

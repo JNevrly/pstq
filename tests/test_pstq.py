@@ -322,6 +322,31 @@ def test_search_command_synchronizes_and_returns_lightweight_json(
     ]
 
 
+def test_search_passes_owner_history_settings_to_synchronization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "archive:\n  pst_path: archive.pst\n  index_path: index.sqlite\n"
+        "history:\n  owner_emails:\n    - owner@example.test\n"
+        "  owner_names:\n    - Owner\n  timezone: Europe/Prague\n"
+    )
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(cli, "sync_pst", lambda *args: calls.append(args))
+    monkeypatch.setattr(cli, "search_messages", lambda *_args, **_kwargs: [])
+
+    result = CliRunner().invoke(cli.main, ["--config", str(config_path), "search", "x"])
+
+    assert result.exit_code == 0
+    assert calls == [
+        (
+            "archive.pst",
+            "index.sqlite",
+            cli.HistorySettings(("owner@example.test",), ("Owner",), "Europe/Prague"),
+        )
+    ]
+
+
 def test_show_command_reads_only_the_persisted_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -489,6 +514,60 @@ def test_attachment_commands_list_metadata_and_extract_bytes(
     assert json.loads(listed_json.output) == values
     assert extracted.output == "Wrote 20 bytes to image.png\n"
     assert calls == [("archive.pst", "index.sqlite", "store:3:0", "image.png")]
+
+
+def test_attachment_passes_owner_history_settings_to_synchronization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "archive:\n  pst_path: archive.pst\n  index_path: index.sqlite\n"
+        "history:\n  owner_names:\n    - Owner\n  timezone: Europe/Prague\n"
+    )
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        cli, "extract_attachment", lambda *args: calls.append(args) or 20
+    )
+
+    result = CliRunner().invoke(
+        cli.main,
+        [
+            "--config",
+            str(config_path),
+            "attachment",
+            "store:3:0",
+            "--output",
+            "image.png",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [
+        (
+            "archive.pst",
+            "index.sqlite",
+            "store:3:0",
+            "image.png",
+            cli.HistorySettings((), ("Owner",), "Europe/Prague"),
+        )
+    ]
+
+
+def test_history_settings_reject_invalid_values() -> None:
+    context = type(
+        "Context",
+        (),
+        {"obj": {"history": {"owner_emails": "owner@example.test"}}},
+    )()
+
+    with pytest.raises(cli.CliContractError, match="Invalid history"):
+        cli._history_settings(context)
+
+    context.obj = {
+        "history": {"owner_emails": [], "owner_names": [], "timezone": "nope"}
+    }
+    with pytest.raises(cli.CliContractError, match="not an IANA"):
+        cli._history_settings(context)
 
 
 def test_attachment_commands_report_errors(
