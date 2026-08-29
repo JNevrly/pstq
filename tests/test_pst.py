@@ -173,6 +173,21 @@ def test_walk_includes_bodies_only_when_requested(tmp_path: Path) -> None:
     assert message.html_body == "<p>HTML body</p>"
 
 
+def test_walk_can_select_bodies_by_message_nid(tmp_path: Path) -> None:
+    path = tmp_path / "archive.pst"
+    path.touch()
+    pypff_file = FakePypffFile(b"store")
+    selected = FakeMessage()
+    selected.identifier = 201
+    pypff_file.root_folder._folders[0]._messages.append(selected)
+
+    with PstReader(path, pypff_module=FakePypff(pypff_file)) as reader:
+        messages = list(reader.walk(include_body_nids={201}))[1].messages
+
+    assert messages[0].plain_text_body is None
+    assert messages[1].plain_text_body == "Plain body"
+
+
 def test_walk_ignores_unavailable_optional_message_properties(tmp_path: Path) -> None:
     path = tmp_path / "archive.pst"
     path.touch()

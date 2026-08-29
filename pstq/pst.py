@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from importlib import import_module
@@ -149,10 +149,16 @@ class PstReader:
                 self._file = None
                 self._store = None
 
-    def walk(self, *, include_bodies: bool = False) -> Iterator[PstFolder]:
+    def walk(
+        self,
+        *,
+        include_bodies: bool = False,
+        include_body_nids: Collection[int] | None = None,
+    ) -> Iterator[PstFolder]:
         """Yield folders depth-first with normalized direct-message records.
 
-        Bodies are opt-in so metadata scans do not read them accidentally.
+        Bodies are opt-in so metadata scans do not read them accidentally.  A
+        caller can instead select just the message NIDs whose bodies it needs.
         """
         pff_file = self._require_open()
         root_folder = pff_file.root_folder
@@ -163,6 +169,7 @@ class PstReader:
             parent_nid=None,
             parent_path="",
             include_bodies=include_bodies,
+            include_body_nids=frozenset(include_body_nids or ()),
         )
 
     def _walk_folder(
@@ -172,6 +179,7 @@ class PstReader:
         parent_nid: int | None,
         parent_path: str,
         include_bodies: bool,
+        include_body_nids: frozenset[int],
     ) -> Iterator[PstFolder]:
         nid = self._nid(folder, "folder")
         name = cast(str | None, self._optional_property(folder, "name"))
@@ -181,6 +189,7 @@ class PstReader:
                 folder.get_sub_message(index),
                 folder_nid=nid,
                 include_bodies=include_bodies,
+                include_body_nids=include_body_nids,
             )
             for index in range(folder.number_of_sub_messages)
         )
@@ -198,6 +207,7 @@ class PstReader:
                 parent_nid=nid,
                 parent_path=path,
                 include_bodies=include_bodies,
+                include_body_nids=include_body_nids,
             )
 
     def _message_from_pypff(
@@ -206,10 +216,13 @@ class PstReader:
         *,
         folder_nid: int,
         include_bodies: bool,
+        include_body_nids: frozenset[int],
     ) -> PstMessage:
         conversation_index = self._optional_property(message, "conversation_index")
+        nid = self._nid(message, "message")
+        should_include_body = include_bodies or nid in include_body_nids
         return PstMessage(
-            nid=self._nid(message, "message"),
+            nid=nid,
             folder_nid=folder_nid,
             modification_time=self._optional_property(message, "modification_time"),
             subject=self._optional_property(message, "subject"),
@@ -227,15 +240,17 @@ class PstReader:
             or 0,
             plain_text_body=(
                 self._optional_property(message, "plain_text_body")
-                if include_bodies
+                if should_include_body
                 else None
             ),
             rtf_body=(
-                self._optional_property(message, "rtf_body") if include_bodies else None
+                self._optional_property(message, "rtf_body")
+                if should_include_body
+                else None
             ),
             html_body=(
                 self._optional_property(message, "html_body")
-                if include_bodies
+                if should_include_body
                 else None
             ),
         )
