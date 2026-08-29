@@ -375,6 +375,73 @@ def test_show_command_selects_cleaned_or_full_body_for_all_output_modes(
     assert full_arguments == [False, True, False, True]
 
 
+def test_thread_command_reads_only_the_persisted_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    value = {
+        "id": "store:3",
+        "messages": [
+            {
+                "body": "First contribution",
+                "date": "2026-08-20T12:00:00",
+                "folder": "Root/Inbox",
+                "from": "First sender",
+                "id": "store:2",
+                "subject": "Status",
+                "to": ["recipient@example.test"],
+            },
+            {
+                "body": "Second contribution",
+                "date": "2026-08-20T12:30:00",
+                "folder": "Root/Inbox",
+                "from": "Second sender",
+                "id": "store:3",
+                "subject": "Re: Status",
+                "to": [],
+            },
+        ],
+    }
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(cli, "get_thread", lambda *args: calls.append(args) or value)
+    monkeypatch.setattr(
+        cli,
+        "sync_pst",
+        lambda *_: (_ for _ in ()).throw(AssertionError("thread must not synchronize")),
+    )
+    config = ["--config", str(_archive_config(tmp_path)), "thread", "store:3"]
+    runner = CliRunner()
+
+    json_result = runner.invoke(cli.main, [*config, "--json"])
+    text_result = runner.invoke(cli.main, config)
+
+    assert json_result.exit_code == 0
+    assert json.loads(json_result.output) == value
+    assert text_result.exit_code == 0
+    assert "Message 1: store:2" in text_result.output
+    assert "First contribution" in text_result.output
+    assert "---" in text_result.output
+    assert "Message 2: store:3" in text_result.output
+    assert calls == [("index.sqlite", "store:3"), ("index.sqlite", "store:3")]
+
+
+def test_thread_command_reports_index_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "get_thread",
+        lambda *_: (_ for _ in ()).throw(ValueError("Message not found: store:3")),
+    )
+
+    result = CliRunner().invoke(
+        cli.main,
+        ["--config", str(_archive_config(tmp_path)), "thread", "store:3"],
+    )
+
+    assert result.exit_code == 1
+    assert "Error: Message not found: store:3" in result.output
+
+
 def test_attachment_commands_list_metadata_and_extract_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

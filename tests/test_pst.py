@@ -9,6 +9,11 @@ import pytest
 
 from pstq import pst
 from pstq.pst import (
+    PID_TAG_CONVERSATION_INDEX,
+    PID_TAG_CONVERSATION_TOPIC,
+    PID_TAG_IN_REPLY_TO_ID,
+    PID_TAG_INTERNET_MESSAGE_ID,
+    PID_TAG_INTERNET_REFERENCES,
     PID_TAG_RECORD_KEY,
     PstFileNotFoundError,
     PstFileUnreadableError,
@@ -57,6 +62,48 @@ class FakeMessage:
     plain_text_body = "Plain body"
     rtf_body = "RTF body"
     html_body = "<p>HTML body</p>"
+
+
+class FakeMessageEntry:
+    def __init__(self, entry_type: int, data: object, text: object) -> None:
+        self.entry_type = entry_type
+        self.data = data
+        self.data_as_string = text
+
+
+class FakeMessageRecordSet:
+    def __init__(self, entries: list[FakeMessageEntry]) -> None:
+        self.entries = entries
+
+
+class LookupMessageRecordSet:
+    def __init__(self, entry: FakeMessageEntry) -> None:
+        self.entry = entry
+
+    def get_entry_by_type(self, entry_type: int) -> FakeMessageEntry | None:
+        return self.entry if entry_type == self.entry.entry_type else None
+
+
+class MapiFakeMessage(FakeMessage):
+    conversation_topic = "Direct topic"
+    conversation_index = bytes.fromhex("010203")
+    record_sets = [
+        FakeMessageRecordSet(
+            [
+                FakeMessageEntry(PID_TAG_CONVERSATION_TOPIC, b"", "MAPI topic"),
+                FakeMessageEntry(PID_TAG_CONVERSATION_INDEX, bytes.fromhex("AABB"), ""),
+                FakeMessageEntry(
+                    PID_TAG_INTERNET_MESSAGE_ID, b"", "<mapi@example.test>"
+                ),
+                FakeMessageEntry(PID_TAG_IN_REPLY_TO_ID, b"", "<parent@example.test>"),
+                FakeMessageEntry(
+                    PID_TAG_INTERNET_REFERENCES,
+                    b"",
+                    "<root@example.test> <parent@example.test>",
+                ),
+            ]
+        )
+    ]
 
 
 class SparseFakeMessage(FakeMessage):
@@ -198,6 +245,52 @@ def test_open_normalizes_record_key_and_walks_messages(tmp_path: Path) -> None:
     assert message.transport_headers == "Message-ID: <message@example.test>"
     assert message.attachment_count == 1
     assert message.plain_text_body is None
+
+
+def test_open_prefers_mapi_relationship_properties(tmp_path: Path) -> None:
+    path = tmp_path / "archive.pst"
+    path.touch()
+    pypff_file = FakePypffFile(bytes.fromhex("AABBCC"))
+    pypff_file.root_folder._folders[0]._messages = [MapiFakeMessage()]
+
+    with PstReader(path, pypff_module=FakePypff(pypff_file)) as reader:
+        message = list(reader.walk())[1].messages[0]
+
+    assert message.conversation_topic == "MAPI topic"
+    assert message.conversation_index == "aabb"
+    assert message.internet_message_id == "<mapi@example.test>"
+    assert message.in_reply_to == "<parent@example.test>"
+    assert message.references_header == "<root@example.test> <parent@example.test>"
+
+
+def test_message_property_helpers_ignore_malformed_entries(tmp_path: Path) -> None:
+    class BrokenTextEntry:
+        entry_type = 0x9999
+
+        @property
+        def data_as_string(self) -> str:
+            raise ValueError("broken")
+
+    class BrokenBytesEntry:
+        entry_type = PID_TAG_CONVERSATION_INDEX
+        data = object()
+
+    class Message:
+        conversation_index = object()
+        record_sets = [
+            LookupMessageRecordSet(
+                FakeMessageEntry(PID_TAG_CONVERSATION_TOPIC, b"", "Topic")
+            ),
+            FakeMessageRecordSet([BrokenTextEntry(), BrokenBytesEntry()]),
+        ]
+
+    reader = PstReader(
+        tmp_path / "archive.pst", pypff_module=FakePypff(FakePypffFile(b"x"))
+    )
+
+    assert reader._message_text(Message(), PID_TAG_CONVERSATION_TOPIC) == "Topic"
+    assert reader._message_text(Message(), 0x9999) is None
+    assert reader._message_bytes(Message(), PID_TAG_CONVERSATION_INDEX) is None
 
 
 def test_open_reads_a_record_key_from_legacy_pypff_entries(tmp_path: Path) -> None:

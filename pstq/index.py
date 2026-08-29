@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+from base64 import b64decode
+from binascii import Error as BinasciiError
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -18,13 +20,14 @@ from typing import cast
 
 from pstq.pst import PstAttachment, PstFolder, PstMessage, PstReader
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 CLEANER_VERSION = 2
 
 _ORIGINAL_MESSAGE_SEPARATOR = re.compile(
     r"^-----Original Message-----\s*$", re.IGNORECASE
 )
 _OUTLOOK_HEADER = re.compile(r"^(From|Sent|To|Cc|Subject):\s+\S.*", re.IGNORECASE)
+_MESSAGE_ID = re.compile(r"<[^<>\s@]+@[^<>\s@]+>")
 _HTML_BLOCK_TAGS = frozenset(
     {"address", "blockquote", "br", "div", "hr", "li", "p", "pre", "tr"}
 )
@@ -382,6 +385,67 @@ def get_message(
         if row is None:
             raise ValueError(f"Message not found: {message_id}")
         recipients = _recipients_for_messages(connection, store_uid, ((nid,),))[nid]
+    return _message_record(store_uid, row, recipients, full=full)
+
+
+def get_thread(database_path: str | Path, message_id: str) -> dict[str, object]:
+    """Return related persisted messages without opening the source PST."""
+    store_uid, anchor_nid = _parse_record_id(message_id)
+    state = _require_index_state(database_path)
+    if store_uid != state.store_uid:
+        raise ValueError(f"Message ID does not belong to this index: {message_id}")
+    with sqlite3.connect(database_path) as connection:
+        connection.text_factory = _decode_sqlite_text
+        relationship_rows = connection.execute(
+            """
+            SELECT nid, internet_message_id, in_reply_to, references_header,
+                   conversation_topic, conversation_index
+            FROM message
+            WHERE store_uid = ?
+            """,
+            (store_uid,),
+        ).fetchall()
+        if not any(row[0] == anchor_nid for row in relationship_rows):
+            raise ValueError(f"Message not found: {message_id}")
+        nids = _thread_members(relationship_rows, anchor_nid)
+        placeholders = ", ".join("?" for _ in nids)
+        rows = connection.execute(
+            f"""
+            SELECT message.nid, message.folder_nid, message.modification_time,
+                   message.subject, message.sender_name, message.client_submit_time,
+                   message.delivery_time, message.transport_headers,
+                   message.internet_message_id, message.in_reply_to,
+                   message.references_header, message.conversation_topic,
+                   message.conversation_index, message.attachment_count,
+                   message.body_raw, message.body_clean, message.body_format,
+                   folder.path
+            FROM message
+            JOIN folder ON folder.store_uid = message.store_uid
+                       AND folder.nid = message.folder_nid
+            WHERE message.store_uid = ? AND message.nid IN ({placeholders})
+            """,
+            (store_uid, *nids),
+        ).fetchall()
+        recipients = _recipients_for_messages(
+            connection, store_uid, tuple((row[0],) for row in rows)
+        )
+    rows.sort(key=_thread_order)
+    return {
+        "id": message_id,
+        "messages": [
+            _message_record(store_uid, row, recipients[row[0]]) for row in rows
+        ],
+    }
+
+
+def _message_record(
+    store_uid: str,
+    row: Sequence[object],
+    recipients: Sequence[str],
+    *,
+    full: bool = False,
+) -> dict[str, object]:
+    """Normalize one SQLite message row for command output."""
     return {
         "attachment_count": row[13],
         "body": _sqlite_optional_text(row[14] if full else row[15]),
@@ -392,9 +456,9 @@ def get_message(
         "date": _sqlite_optional_text(row[6] or row[5]),
         "delivery_time": _sqlite_optional_text(row[6]),
         "folder": _sqlite_optional_text(row[17]),
-        "folder_id": _record_id(store_uid, row[1]),
+        "folder_id": _record_id(store_uid, cast(int, row[1])),
         "from": _sqlite_optional_text(row[4]),
-        "id": message_id,
+        "id": _record_id(store_uid, cast(int, row[0])),
         "in_reply_to": _sqlite_optional_text(row[9]),
         "internet_message_id": _sqlite_optional_text(row[8]),
         "modification_time": _sqlite_optional_text(row[2]),
@@ -886,11 +950,11 @@ def _upsert_message(
             _format_time(message.client_submit_time),
             _format_time(message.delivery_time),
             message.transport_headers,
-            relationships["internet_message_id"],
-            relationships["in_reply_to"],
-            relationships["references_header"],
-            message.conversation_topic,
-            message.conversation_index,
+            message.internet_message_id or relationships["internet_message_id"],
+            message.in_reply_to or relationships["in_reply_to"],
+            message.references_header or relationships["references_header"],
+            message.conversation_topic or relationships["conversation_topic"],
+            message.conversation_index or relationships["conversation_index"],
             message.attachment_count,
             body_raw,
             clean_body(
@@ -1107,13 +1171,122 @@ def _relationships(headers: str | None) -> dict[str, str | None]:
             "internet_message_id": None,
             "in_reply_to": None,
             "references_header": None,
+            "conversation_topic": None,
+            "conversation_index": None,
         }
     parsed = HeaderParser(policy=policy.default).parsestr(headers)
     return {
         "internet_message_id": parsed.get("Message-ID"),
         "in_reply_to": parsed.get("In-Reply-To"),
         "references_header": parsed.get("References"),
+        "conversation_topic": parsed.get("Thread-Topic"),
+        "conversation_index": _thread_index(parsed.get("Thread-Index")),
     }
+
+
+def _thread_index(value: str | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        decoded = b64decode(value, validate=True)
+    except (BinasciiError, ValueError):
+        return None
+    return decoded.hex() if decoded else None
+
+
+def _thread_members(
+    rows: Sequence[Sequence[object]], anchor_nid: int
+) -> tuple[int, ...]:
+    """Choose the strongest available indexed relationship component."""
+    metadata = {cast(int, row[0]): row for row in rows}
+    message_ids: dict[str, set[int]] = {}
+    for nid, row in metadata.items():
+        for value in _message_ids(_sqlite_optional_text(row[1])):
+            message_ids.setdefault(value, set()).add(nid)
+
+    neighbors: dict[int, set[int]] = {nid: set() for nid in metadata}
+    for matching_nids in message_ids.values():
+        for nid in matching_nids:
+            neighbors[nid].update(matching_nids - {nid})
+    for nid, row in metadata.items():
+        references = _message_ids(_sqlite_optional_text(row[2]))
+        references.update(_message_ids(_sqlite_optional_text(row[3])))
+        for reference in references:
+            for target_nid in message_ids.get(reference, ()):
+                if target_nid != nid:
+                    neighbors[nid].add(target_nid)
+                    neighbors[target_nid].add(nid)
+
+    members = _connected_members(neighbors, anchor_nid)
+    if len(members) > 1:
+        return tuple(members)
+
+    conversation_root = _conversation_root(
+        _sqlite_optional_text(metadata[anchor_nid][5])
+    )
+    if conversation_root is not None:
+        members = {
+            nid
+            for nid, row in metadata.items()
+            if _conversation_root(_sqlite_optional_text(row[5])) == conversation_root
+        }
+        if len(members) > 1:
+            return tuple(members)
+
+    topic = _conversation_topic(_sqlite_optional_text(metadata[anchor_nid][4]))
+    if topic is not None:
+        members = {
+            nid
+            for nid, row in metadata.items()
+            if _conversation_topic(_sqlite_optional_text(row[4])) == topic
+        }
+        if len(members) > 1:
+            return tuple(members)
+    return (anchor_nid,)
+
+
+def _message_ids(value: str | None) -> set[str]:
+    return {match.group().casefold() for match in _MESSAGE_ID.finditer(value or "")}
+
+
+def _connected_members(neighbors: dict[int, set[int]], anchor_nid: int) -> set[int]:
+    members = {anchor_nid}
+    pending = [anchor_nid]
+    while pending:
+        nid = pending.pop()
+        for neighbor in neighbors[nid] - members:
+            members.add(neighbor)
+            pending.append(neighbor)
+    return members
+
+
+def _conversation_root(value: str | None) -> str | None:
+    if value is None or len(value) < 44 or len(value) % 2:
+        return None
+    try:
+        bytes.fromhex(value)
+    except ValueError:
+        return None
+    return value[:44].casefold()
+
+
+def _conversation_topic(value: str | None) -> str | None:
+    normalized = (value or "").strip().casefold()
+    return normalized or None
+
+
+def _thread_order(row: Sequence[object]) -> tuple[int, datetime, int]:
+    value = _sqlite_optional_text(row[6] or row[5])
+    if value is not None:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            pass
+        else:
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(UTC).replace(tzinfo=None)
+            return (0, parsed, cast(int, row[0]))
+    return (1, datetime.max, cast(int, row[0]))
 
 
 def _replace_recipients(

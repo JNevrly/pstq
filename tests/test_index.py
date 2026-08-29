@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -200,6 +200,264 @@ def test_import_pst_creates_normalized_cache(tmp_path: Path) -> None:
     )
     assert state[0][:5] == ("archive.pst", 1, 1, "store", index.SCHEMA_VERSION)
     assert state[0][5]
+
+
+def test_import_pst_prefers_mapi_relationship_values_and_falls_back_to_headers(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "index.sqlite"
+    FakeReader.folders = _records(
+        replace(
+            _message(),
+            internet_message_id="<mapi@example.test>",
+            in_reply_to="<mapi-parent@example.test>",
+            references_header="<mapi-root@example.test>",
+            conversation_topic=None,
+            conversation_index=None,
+            transport_headers=(
+                "Message-ID: <header@example.test>\n"
+                "Thread-Topic: Header topic\n"
+                "Thread-Index: AQID\n"
+            ),
+        )
+    )
+
+    index.import_pst("archive.pst", database_path)
+
+    assert _rows(
+        database_path,
+        """
+        SELECT internet_message_id, in_reply_to, references_header,
+               conversation_topic, conversation_index
+        FROM message
+        """,
+    ) == [
+        (
+            "<mapi@example.test>",
+            "<mapi-parent@example.test>",
+            "<mapi-root@example.test>",
+            "Header topic",
+            "010203",
+        )
+    ]
+
+
+def _thread_message(
+    nid: int,
+    *,
+    headers: str | None,
+    body: str,
+    delivery_time: datetime | None,
+    client_submit_time: datetime | None = None,
+    conversation_topic: str | None = None,
+    conversation_index: str | None = None,
+) -> PstMessage:
+    return replace(
+        _message(nid=nid),
+        transport_headers=headers,
+        plain_text_body=body,
+        html_body=None,
+        rtf_body=None,
+        delivery_time=delivery_time,
+        client_submit_time=client_submit_time,
+        conversation_topic=conversation_topic,
+        conversation_index=conversation_index,
+    )
+
+
+def test_get_thread_follows_transitive_header_relations_and_keeps_bodies_separate(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "index.sqlite"
+    FakeReader.folders = _records(
+        _thread_message(
+            10,
+            headers="Message-ID: <root@example.test>",
+            body="Root contribution",
+            delivery_time=datetime(2026, 8, 20, 10),
+            conversation_topic="Generic status",
+        ),
+        _thread_message(
+            11,
+            headers=(
+                "Message-ID: <parent@example.test>\nIn-Reply-To: <root@example.test>\n"
+            ),
+            body="Parent contribution",
+            delivery_time=datetime(2026, 8, 20, 11),
+            conversation_topic="Generic status",
+        ),
+        _thread_message(
+            12,
+            headers=(
+                "Message-ID: <reply@example.test>\n"
+                "References: <root@example.test> <parent@example.test>\n"
+            ),
+            body="Reply contribution",
+            delivery_time=datetime(2026, 8, 20, 12),
+            conversation_topic="Generic status",
+        ),
+        _thread_message(
+            13,
+            headers="Message-ID: <unrelated@example.test>",
+            body="Unrelated contribution",
+            delivery_time=datetime(2026, 8, 20, 13),
+            conversation_topic="Generic status",
+        ),
+    )
+    index.import_pst("archive.pst", database_path)
+
+    result = index.get_thread(database_path, "store:11")
+
+    assert result["id"] == "store:11"
+    assert [message["id"] for message in result["messages"]] == [
+        "store:10",
+        "store:11",
+        "store:12",
+    ]
+    assert [message["body"] for message in result["messages"]] == [
+        "Root contribution",
+        "Parent contribution",
+        "Reply contribution",
+    ]
+
+
+def test_get_thread_uses_conversation_index_then_topic_as_conservative_fallbacks(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "index.sqlite"
+    root = "ab" * 22
+    FakeReader.folders = _records(
+        _thread_message(
+            20,
+            headers=None,
+            body="First indexed contribution",
+            delivery_time=datetime(2026, 8, 20, 10),
+            conversation_topic="Shared topic",
+            conversation_index=f"{root}0102030405",
+        ),
+        _thread_message(
+            21,
+            headers=None,
+            body="Second indexed contribution",
+            delivery_time=datetime(2026, 8, 20, 11),
+            conversation_topic="Shared topic",
+            conversation_index=f"{root}060708090a",
+        ),
+        _thread_message(
+            22,
+            headers=None,
+            body="Same topic but another thread",
+            delivery_time=datetime(2026, 8, 20, 12),
+            conversation_topic="Shared topic",
+            conversation_index="cd" * 22,
+        ),
+    )
+    index.import_pst("archive.pst", database_path)
+
+    indexed = index.get_thread(database_path, "store:20")
+
+    assert [message["id"] for message in indexed["messages"]] == [
+        "store:20",
+        "store:21",
+    ]
+
+    FakeReader.folders = _records(
+        _thread_message(
+            30,
+            headers="Message-ID: malformed",
+            body="Topic one",
+            delivery_time=datetime(2026, 8, 20, 10),
+            conversation_topic="Topic fallback",
+            conversation_index="not-hex",
+        ),
+        _thread_message(
+            31,
+            headers=None,
+            body="Topic two",
+            delivery_time=datetime(2026, 8, 20, 11),
+            conversation_topic=" topic FALLBACK ",
+        ),
+        _thread_message(
+            32,
+            headers=None,
+            body="Different topic",
+            delivery_time=datetime(2026, 8, 20, 12),
+            conversation_topic="Other topic",
+        ),
+    )
+    index.import_pst("archive.pst", database_path)
+
+    topic = index.get_thread(database_path, "store:30")
+
+    assert [message["id"] for message in topic["messages"]] == [
+        "store:30",
+        "store:31",
+    ]
+
+
+def test_get_thread_orders_dates_deterministically_and_returns_partial_anchor(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "index.sqlite"
+    FakeReader.folders = _records(
+        _thread_message(
+            42,
+            headers="Message-ID: <late@example.test>\nIn-Reply-To: <root@example.test>",
+            body="Late",
+            delivery_time=datetime(2026, 8, 20, 12, tzinfo=UTC),
+        ),
+        _thread_message(
+            41,
+            headers=(
+                "Message-ID: <early@example.test>\nIn-Reply-To: <root@example.test>"
+            ),
+            body="Early",
+            delivery_time=datetime(
+                2026, 8, 20, 12, tzinfo=timezone(timedelta(hours=2))
+            ),
+        ),
+        _thread_message(
+            40,
+            headers="Message-ID: <root@example.test>",
+            body="Root",
+            delivery_time=None,
+            client_submit_time=None,
+        ),
+        _thread_message(
+            43,
+            headers="Message-ID: malformed",
+            body="Partial",
+            delivery_time=None,
+            client_submit_time=None,
+            conversation_topic=None,
+            conversation_index="bad",
+        ),
+    )
+    index.import_pst("archive.pst", database_path)
+
+    threaded = index.get_thread(database_path, "store:42")
+    partial = index.get_thread(database_path, "store:43")
+
+    assert [message["id"] for message in threaded["messages"]] == [
+        "store:41",
+        "store:42",
+        "store:40",
+    ]
+    assert [message["id"] for message in partial["messages"]] == ["store:43"]
+    with pytest.raises(ValueError, match="does not belong"):
+        index.get_thread(database_path, "other:42")
+    with pytest.raises(ValueError, match="Message not found"):
+        index.get_thread(database_path, "store:99")
+
+
+def test_thread_parsers_ignore_malformed_values() -> None:
+    assert index._thread_index("not base64") is None
+    assert index._conversation_root("zz" * 22) is None
+    assert index._thread_order((1, None, None, None, None, "bad", None)) == (
+        1,
+        datetime.max,
+        1,
+    )
 
 
 @pytest.mark.parametrize(
@@ -550,6 +808,8 @@ def test_relationship_parser_handles_missing_headers() -> None:
         "internet_message_id": None,
         "in_reply_to": None,
         "references_header": None,
+        "conversation_topic": None,
+        "conversation_index": None,
     }
 
 

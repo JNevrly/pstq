@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any, Protocol, Self, cast
 
 PID_TAG_RECORD_KEY = 0x0FF9
+PID_TAG_CONVERSATION_TOPIC = 0x0070
+PID_TAG_CONVERSATION_INDEX = 0x0071
+PID_TAG_INTERNET_MESSAGE_ID = 0x1035
+PID_TAG_INTERNET_REFERENCES = 0x1039
+PID_TAG_IN_REPLY_TO_ID = 0x1042
 PID_TAG_ATTACH_FILENAME = 0x3704
 PID_TAG_ATTACH_METHOD = 0x3705
 PID_TAG_ATTACH_LONG_FILENAME = 0x3707
@@ -91,6 +96,9 @@ class PstMessage:
     html_body: str | bytes | None
     attachments: tuple[PstAttachment, ...] = ()
     index_in_folder: int = 0
+    internet_message_id: str | None = None
+    in_reply_to: str | None = None
+    references_header: str | None = None
 
 
 @dataclass(frozen=True)
@@ -250,7 +258,7 @@ class PstReader:
         include_bodies: bool,
         include_body_nids: frozenset[int],
     ) -> PstMessage:
-        conversation_index = self._optional_property(message, "conversation_index")
+        conversation_index = self._message_bytes(message, PID_TAG_CONVERSATION_INDEX)
         nid = self._nid(message, "message")
         should_include_body = include_bodies or nid in include_body_nids
         return PstMessage(
@@ -262,7 +270,10 @@ class PstReader:
             client_submit_time=self._optional_property(message, "client_submit_time"),
             delivery_time=self._optional_property(message, "delivery_time"),
             transport_headers=self._optional_property(message, "transport_headers"),
-            conversation_topic=self._optional_property(message, "conversation_topic"),
+            conversation_topic=(
+                self._message_text(message, PID_TAG_CONVERSATION_TOPIC)
+                or self._optional_property(message, "conversation_topic")
+            ),
             conversation_index=(
                 bytes(conversation_index).hex()
                 if conversation_index is not None
@@ -287,6 +298,11 @@ class PstReader:
             ),
             attachments=self._attachments(message) if should_include_body else (),
             index_in_folder=index_in_folder,
+            internet_message_id=self._message_text(
+                message, PID_TAG_INTERNET_MESSAGE_ID
+            ),
+            in_reply_to=self._message_text(message, PID_TAG_IN_REPLY_TO_ID),
+            references_header=self._message_text(message, PID_TAG_INTERNET_REFERENCES),
         )
 
     def extract_attachment(
@@ -392,6 +408,47 @@ class PstReader:
         except (AttributeError, OSError):
             pass
         return None
+
+    def _message_entry(self, message: Any, property_tag: int) -> Any:
+        try:
+            for record_set in message.record_sets:
+                get_entry_by_type = getattr(record_set, "get_entry_by_type", None)
+                if get_entry_by_type is not None:
+                    entry = get_entry_by_type(property_tag)
+                    if entry is not None:
+                        return entry
+                    continue
+                for entry in record_set.entries:
+                    if entry.entry_type == property_tag:
+                        return entry
+        except (AttributeError, OSError):
+            pass
+        return None
+
+    def _message_text(self, message: Any, property_tag: int) -> str | None:
+        entry = self._message_entry(message, property_tag)
+        if entry is None:
+            return None
+        try:
+            value = entry.data_as_string
+        except (AttributeError, OSError, ValueError):
+            return None
+        return value if isinstance(value, str) and value else None
+
+    def _message_bytes(self, message: Any, property_tag: int) -> bytes | None:
+        entry = self._message_entry(message, property_tag)
+        if entry is not None:
+            try:
+                value = bytes(entry.data)
+            except (AttributeError, OSError, TypeError, ValueError):
+                value = None
+            if value:
+                return value
+        value = self._optional_property(message, "conversation_index")
+        try:
+            return bytes(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
 
     def _attachment_text(self, attachment: Any, property_tag: int) -> str | None:
         entry = self._attachment_entry(attachment, property_tag)

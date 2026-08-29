@@ -15,6 +15,7 @@ from pstq.index import (
     PstSynchronizationError,
     extract_attachment,
     get_message,
+    get_thread,
     index_status,
     list_attachments,
     list_folders,
@@ -279,6 +280,38 @@ def show(
         click.echo(f"{label}: {message[key]}")
     click.echo()
     click.echo(cast(str | None, message["body"]) or "")
+
+
+@main.command()
+@click.argument("message_id")
+@click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
+@click.pass_context
+def thread(ctx: click.Context, message_id: str, json_output: bool) -> None:
+    """Display related persisted messages as separate cleaned contributions."""
+    _, database_path = _configured_paths(ctx)
+    try:
+        result = get_thread(database_path, message_id)
+    except (OSError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
+    if json_output:
+        click.echo(_json(result), nl=False)
+        return
+    for position, message in enumerate(
+        cast(list[dict[str, object]], result["messages"]), 1
+    ):
+        if position > 1:
+            click.echo("\n---\n")
+        click.echo(f"Message {position}: {message['id']}")
+        for label, key in (
+            ("Date", "date"),
+            ("From", "from"),
+            ("To", "to"),
+            ("Subject", "subject"),
+            ("Folder", "folder"),
+        ):
+            click.echo(f"{label}: {message[key]}")
+        click.echo()
+        click.echo(cast(str | None, message["body"]) or "")
 
 
 @main.command()
