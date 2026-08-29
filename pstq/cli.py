@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Sequence
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, cast
@@ -34,9 +35,63 @@ from pstq.pst import PstReaderError
 DEFAULT_CONFIG_FILE = str(files("pstq").joinpath("default_config.yaml"))
 
 
+class CliContractError(click.ClickException):
+    """A predictable failure with an agent-facing error code."""
+
+    def __init__(self, message: str, code: str = "command_failed") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class CliContractGroup(click.Group):
+    """Render every expected command failure in the selected output format."""
+
+    def main(
+        self,
+        args: Sequence[str] | None = None,
+        prog_name: str | None = None,
+        complete_var: str | None = None,
+        standalone_mode: bool = True,
+        **extra: Any,
+    ) -> Any:
+        requested_args = sys.argv[1:] if args is None else args
+        try:
+            return super().main(
+                args=args,
+                prog_name=prog_name,
+                complete_var=complete_var,
+                standalone_mode=False,
+                **extra,
+            )
+        except click.ClickException as error:
+            if _json_requested(requested_args):
+                click.echo(
+                    _json(
+                        {
+                            "error": {
+                                "code": getattr(error, "code", "invalid_request"),
+                                "message": error.format_message(),
+                            }
+                        }
+                    ),
+                    err=True,
+                    nl=False,
+                )
+            else:
+                error.show()
+            if standalone_mode:
+                raise SystemExit(error.exit_code) from error
+            raise click.exceptions.Exit(error.exit_code) from error
+
+
 @click.group(
+    cls=CliContractGroup,
     invoke_without_command=True,
-    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+    context_settings={
+        "allow_extra_args": True,
+        "help_option_names": ["-h", "--help"],
+        "ignore_unknown_options": True,
+    },
 )
 @click.option(
     "--config",
@@ -52,7 +107,35 @@ DEFAULT_CONFIG_FILE = str(files("pstq").joinpath("default_config.yaml"))
 )
 @click.pass_context
 def main(ctx: click.Context, config: str | None, get_config_template: Any) -> None:
-    """Inspect PST metadata and compare snapshots."""
+    """Query one Outlook PST through a local, disposable SQLite cache.
+
+    Configuration:
+      Set archive.pst_path and archive.index_path in --config FILE, or set
+      PSTQ_ARCHIVE__PST_PATH and PSTQ_ARCHIVE__INDEX_PATH. Exactly one PST and
+      one SQLite cache are configured per invocation. The index directory must
+      already exist: synchronization creates a sibling temporary database and
+      atomically replaces the cache only after a successful source check.
+
+    Agent contract:
+      Use --json for deterministic, pretty-printed JSON with sorted keys.
+      Stable message and folder IDs are STORE_UID:NID; attachment IDs are
+      STORE_UID:MESSAGE_NID:INDEX. Read each command's --help for its complete
+      request, result schema, limits, and source/cache access behavior.
+      Runtime failures in JSON mode are written to stderr as
+      {"error":{"code":"...","message":"..."}}. Exit 0 means success,
+      1 means an operational/configuration failure, and 2 means invalid CLI
+      input. Stack traces are not emitted unless Python is explicitly asked to
+      debug the process.
+
+    Safety and synchronization:
+      PST files are always opened read-only and are never modified. SQLite is a
+      disposable cache, not a source of truth. search and attachment synchronize
+      first when source path, size, mtime, schema, or cleaner version differs;
+      status, folders, show, thread, and attachments read SQLite only. Do not
+      run against a PST Outlook is modifying. libpff/pypff can fail on malformed
+      or unsupported PST structures, and stock pypff has no direct item lookup;
+      attachment extraction uses a cached, validated traversal locator instead.
+    """
     config_manager = ConfigManager(
         DEFAULT_CONFIG_FILE,
         env_var_prefix="pstq",
@@ -67,9 +150,7 @@ def main(ctx: click.Context, config: str | None, get_config_template: Any) -> No
     try:
         config_manager.validate()
     except ConfigValidationError as error:
-        click.secho("<----------------Configuration problem---------------->", fg="red")
-        click.secho(str(error), fg="red", err=True)
-        sys.exit(1)
+        raise CliContractError(str(error), "configuration_error") from error
     ctx.obj = config_manager.config
 
 
@@ -80,11 +161,19 @@ def main(ctx: click.Context, config: str | None, get_config_template: Any) -> No
 )
 @click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
 def inspect(path: str, sample_size: int, json_output: bool) -> None:
-    """Report metadata traversal performance for PATH."""
+    """Report read-only metadata traversal performance for PATH.
+
+    This diagnostic bypasses the configured cache and opens PATH read-only. It
+    does not request message bodies or attachment bytes. --sample-size defaults
+    to 10 and may be zero. With --json, the object schema is
+    {duration_seconds, folder_count, libpff_version, message_count,
+    messages_per_second, pst_size, samples, scan_errors, store_uid}; samples
+    contain nid, folder_path, modification_time, and subject.
+    """
     try:
         report = inspect_pst(path, sample_size=sample_size)
     except (OSError, PstReaderError, ValueError) as error:
-        raise click.ClickException(str(error)) from error
+        raise _command_error(error) from error
     if json_output:
         click.echo(_json(report.as_dict()), nl=False)
         return
@@ -112,12 +201,17 @@ def inspect(path: str, sample_size: int, json_output: bool) -> None:
 @click.argument("path", type=click.Path(path_type=str))
 @click.argument("output", type=click.Path(path_type=str, dir_okay=False))
 def snapshot(path: str, output: str) -> None:
-    """Write a body-free metadata snapshot for PATH to OUTPUT."""
+    """Write a body-free metadata snapshot for PATH to OUTPUT.
+
+    PATH is opened read-only. OUTPUT is JSON with format_version, store_uid,
+    folders [{nid, path}], and messages [{nid, folder_nid, modification_time}].
+    This diagnostic command writes OUTPUT and does not use archive.index_path.
+    """
     try:
         report = inspect_pst(path, sample_size=0)
         write_snapshot(report.snapshot, output)
     except (OSError, PstReaderError, ValueError) as error:
-        raise click.ClickException(str(error)) from error
+        raise _command_error(error) from error
     click.echo(f"Wrote snapshot with {report.message_count} messages to {output}")
 
 
@@ -126,11 +220,17 @@ def snapshot(path: str, output: str) -> None:
 @click.argument("after", type=click.Path(exists=True, dir_okay=False, path_type=str))
 @click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
 def compare_snapshots_command(before: str, after: str, json_output: bool) -> None:
-    """Classify metadata changes between BEFORE and AFTER snapshots."""
+    """Classify metadata changes between BEFORE and AFTER snapshots.
+
+    Inputs must be snapshots made by snapshot. --json returns an object with
+    new, missing, modified, moved, unchanged, and suspicious_identity. The
+    first four are lists of metadata records; unchanged is a count summary;
+    suspicious_identity reports whether the source store UID changed.
+    """
     try:
         comparison = compare_snapshots(read_snapshot(before), read_snapshot(after))
     except SnapshotFormatError as error:
-        raise click.ClickException(str(error)) from error
+        raise _command_error(error) from error
     if json_output:
         click.echo(_json(comparison), nl=False)
         return
@@ -151,7 +251,14 @@ def compare_snapshots_command(before: str, after: str, json_output: bool) -> Non
 @click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
 @click.pass_context
 def status(ctx: click.Context, json_output: bool) -> None:
-    """Report configured source and SQLite index freshness."""
+    """Report configured source and SQLite cache freshness without opening PST.
+
+    --json returns {cleaner_version, fresh, index_exists, index_path,
+    last_successful_sync, schema_version, source_error, source_mtime_ns,
+    source_path, source_size, store_uid}. fresh is true only when cache schema,
+    cleaner version, and source path/size/mtime agree. This command never
+    synchronizes and can report a missing or unreadable source in source_error.
+    """
     source_path, database_path = _configured_paths(ctx)
     report = index_status(source_path, database_path)
     if json_output:
@@ -177,12 +284,18 @@ def status(ctx: click.Context, json_output: bool) -> None:
 @click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
 @click.pass_context
 def folders(ctx: click.Context, json_output: bool) -> None:
-    """List indexed folders with stable IDs and paths."""
+    """List folders from the existing cache with stable IDs and paths.
+
+    --json returns a path-ordered array of {id, name, parent_id, path}. id and
+    parent_id use STORE_UID:NID; parent_id is null for the root. This command
+    reads SQLite only and fails if no usable cache exists; run search first to
+    create or refresh it.
+    """
     _, database_path = _configured_paths(ctx)
     try:
         values = list_folders(database_path)
     except (OSError, ValueError) as error:
-        raise click.ClickException(str(error)) from error
+        raise _command_error(error) from error
     if json_output:
         click.echo(_json(values), nl=False)
         return
@@ -219,7 +332,20 @@ def search(
     limit: int,
     json_output: bool,
 ) -> None:
-    """Synchronize when needed, then search indexed message text."""
+    """Synchronize when needed, then run a bounded FTS5 search.
+
+    QUERY uses SQLite FTS5 syntax and must not be empty. --from and --to match
+    sender and persisted recipient text; --after is inclusive and --before is
+    exclusive ISO-8601 timestamp filtering; --folder is an exact cached path;
+    --has-attachment requires attachment_count > 0. --limit defaults to 20 and
+    accepts 1 through 100. search compares source path, size, and mtime before
+    querying, then atomically synchronizes if the cache is stale.
+
+    --json returns at most limit lightweight records, ordered by FTS score then
+    message NID: [{date, folder, from, id, score, snippet, subject, to}]. id is
+    the stable STORE_UID:NID selector for show, thread, and attachments. Bodies
+    are intentionally omitted; call show only for relevant candidates.
+    """
     source_path, database_path = _configured_paths(ctx)
     try:
         sync_pst(source_path, database_path)
@@ -235,7 +361,7 @@ def search(
             limit=limit,
         )
     except (OSError, PstReaderError, PstSynchronizationError, ValueError) as error:
-        raise click.ClickException(str(error)) from error
+        raise _command_error(error) from error
     if json_output:
         click.echo(_json([value.as_dict() for value in values]), nl=False)
         return
@@ -259,12 +385,24 @@ def search(
 def show(
     ctx: click.Context, message_id: str, full_body: bool, json_output: bool
 ) -> None:
-    """Display one persisted message with cleaned content by default."""
+    """Display one persisted message from SQLite; use --full for raw body.
+
+    MESSAGE_ID must be the STORE_UID:NID returned by search. The default body is
+    conservatively cleaned of recognizable quoted history; --full selects the
+    preserved raw body in both text and JSON output. This command does not open
+    or synchronize the PST.
+
+    --json returns {attachment_count, body, body_format, client_submit_time,
+    conversation_index, conversation_topic, date, delivery_time, folder,
+    folder_id, from, id, in_reply_to, internet_message_id, modification_time,
+    references, subject, to, transport_headers}. Values may be null when the
+    PST did not expose that property. id and folder_id are stable STORE_UID:NID.
+    """
     _, database_path = _configured_paths(ctx)
     try:
         message = get_message(database_path, message_id, full=full_body)
     except (OSError, ValueError) as error:
-        raise click.ClickException(str(error)) from error
+        raise _command_error(error) from error
     if json_output:
         click.echo(_json(message), nl=False)
         return
@@ -287,12 +425,20 @@ def show(
 @click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
 @click.pass_context
 def thread(ctx: click.Context, message_id: str, json_output: bool) -> None:
-    """Display related persisted messages as separate cleaned contributions."""
+    """Display related cached messages as separate cleaned contributions.
+
+    MESSAGE_ID is a STORE_UID:NID. --json returns {id, messages}, where id is
+    the requested selector and messages is a chronological array of the same
+    message schema returned by show (with the cleaned body). Relationships use
+    persisted Internet headers and Outlook conversation metadata; absent or
+    inconsistent metadata can leave a thread incomplete. This command reads
+    SQLite only and does not open or synchronize the PST.
+    """
     _, database_path = _configured_paths(ctx)
     try:
         result = get_thread(database_path, message_id)
     except (OSError, ValueError) as error:
-        raise click.ClickException(str(error)) from error
+        raise _command_error(error) from error
     if json_output:
         click.echo(_json(result), nl=False)
         return
@@ -319,12 +465,19 @@ def thread(ctx: click.Context, message_id: str, json_output: bool) -> None:
 @click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
 @click.pass_context
 def attachments(ctx: click.Context, message_id: str, json_output: bool) -> None:
-    """List persisted attachment metadata without opening the PST."""
+    """List persisted attachment metadata from SQLite without opening the PST.
+
+    MESSAGE_ID is a STORE_UID:NID. --json returns an index-ordered array of
+    {attachment_method, content_id, content_location, filename, hidden, id,
+    mime_type, rendering_position, size}. id is the stable
+    STORE_UID:MESSAGE_NID:INDEX selector for attachment. Metadata fields may be
+    null when unavailable. This command reads SQLite only and does not refresh.
+    """
     _, database_path = _configured_paths(ctx)
     try:
         values = list_attachments(database_path, message_id)
     except (OSError, ValueError) as error:
-        raise click.ClickException(str(error)) from error
+        raise _command_error(error) from error
     if json_output:
         click.echo(_json(values), nl=False)
         return
@@ -345,12 +498,20 @@ def attachments(ctx: click.Context, message_id: str, json_output: bool) -> None:
 )
 @click.pass_context
 def attachment(ctx: click.Context, attachment_id: str, output: str) -> None:
-    """Write original attachment bytes through a cached PST locator."""
+    """Write original attachment bytes through its cached PST traversal locator.
+
+    ATTACHMENT_ID must be the STORE_UID:MESSAGE_NID:INDEX returned by
+    attachments. --output is required and names a new output file; existing
+    files may be replaced by the operating system. This command synchronizes if
+    the source changed, validates that the cached locator still reaches the
+    expected item, then opens the PST read-only to copy original bytes. It emits
+    a human-readable byte count and has no JSON success mode.
+    """
     source_path, database_path = _configured_paths(ctx)
     try:
         written = extract_attachment(source_path, database_path, attachment_id, output)
     except (OSError, PstReaderError, PstSynchronizationError, ValueError) as error:
-        raise click.ClickException(str(error)) from error
+        raise _command_error(error) from error
     click.echo(f"Wrote {written} bytes to {output}")
 
 
@@ -360,15 +521,28 @@ def _configured_paths(ctx: click.Context) -> tuple[str, str]:
     source_path = archive.get("pst_path")
     database_path = archive.get("index_path")
     if not isinstance(source_path, str) or not isinstance(database_path, str):
-        raise click.ClickException(
+        raise CliContractError(
             "Configure archive.pst_path and archive.index_path before using "
-            "this command."
+            "this command.",
+            "configuration_error",
         )
     return str(Path(source_path)), str(Path(database_path))
 
 
 def _json(value: Any) -> str:
     return json.dumps(value, indent=2, sort_keys=True) + "\n"
+
+
+def _command_error(error: Exception) -> CliContractError:
+    if isinstance(error, PstSynchronizationError):
+        return CliContractError(str(error), "synchronization_error")
+    if isinstance(error, (OSError, PstReaderError)):
+        return CliContractError(str(error), "source_error")
+    return CliContractError(str(error), "invalid_request")
+
+
+def _json_requested(args: Sequence[str] | None) -> bool:
+    return args is not None and "--json" in args
 
 
 if __name__ == "__main__":  # pragma: no cover

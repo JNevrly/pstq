@@ -32,13 +32,28 @@ def test_content(response):
 
 
 def test_command_line_interface():
-    """The CLI exposes PST metadata commands."""
+    """Every command exposes its agent-facing contract through --help."""
     runner = CliRunner()
     result = runner.invoke(cli.main, ["--help"])
     assert result.exit_code == 0
     assert "compare-snapshots" in result.output
     assert "inspect" in result.output
     assert "snapshot" in result.output
+    assert "PSTQ_ARCHIVE__PST_PATH" in result.output
+    assert "STORE_UID:NID" in result.output
+
+    for command in (
+        "status",
+        "folders",
+        "search",
+        "show",
+        "thread",
+        "attachments",
+        "attachment",
+    ):
+        command_help = runner.invoke(cli.main, [command, "--help"])
+        assert command_help.exit_code == 0
+        assert "--json" in command_help.output or command == "attachment"
 
 
 def test_inspect_command_outputs_deterministic_json(monkeypatch):
@@ -209,8 +224,7 @@ def test_configuration_error_is_reported(monkeypatch):
     result = CliRunner().invoke(cli.main)
 
     assert result.exit_code == 1
-    assert "Configuration problem" in result.output
-    assert "invalid config" in result.output
+    assert result.output == "Error: invalid config\n"
 
 
 def _archive_config(tmp_path: Path) -> Path:
@@ -609,3 +623,54 @@ def test_agent_commands_report_cache_and_search_errors(
     assert "Error: missing message" in show.output
     assert missing_config.exit_code == 1
     assert "Configure archive.pst_path" in missing_config.output
+
+
+def test_json_errors_have_a_stable_envelope_and_no_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = ["--config", str(_archive_config(tmp_path))]
+    monkeypatch.setattr(cli, "sync_pst", lambda *_: None)
+    monkeypatch.setattr(
+        cli,
+        "search_messages",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("bad query")),
+    )
+    runner = CliRunner()
+
+    runtime_error = runner.invoke(cli.main, [*config, "search", "bad", "--json"])
+    invalid_limit = runner.invoke(
+        cli.main, [*config, "search", "valid", "--limit", "101", "--json"]
+    )
+    missing_config = runner.invoke(cli.main, ["status", "--json"])
+    monkeypatch.setattr(
+        cli,
+        "sync_pst",
+        lambda *_: (_ for _ in ()).throw(cli.PstSynchronizationError("changed PST")),
+    )
+    synchronization_error = runner.invoke(
+        cli.main,
+        [*config, "search", "valid", "--json"],
+        standalone_mode=False,
+    )
+
+    assert runtime_error.exit_code == 1
+    assert json.loads(runtime_error.output) == {
+        "error": {"code": "invalid_request", "message": "bad query"}
+    }
+    assert invalid_limit.exit_code == 2
+    assert json.loads(invalid_limit.output)["error"]["code"] == "invalid_request"
+    assert missing_config.exit_code == 1
+    assert json.loads(missing_config.output) == {
+        "error": {
+            "code": "configuration_error",
+            "message": (
+                "Configure archive.pst_path and archive.index_path before using "
+                "this command."
+            ),
+        }
+    }
+    assert synchronization_error.exit_code == 1
+    assert json.loads(synchronization_error.output) == {
+        "error": {"code": "synchronization_error", "message": "changed PST"}
+    }
+    assert "Traceback" not in runtime_error.output

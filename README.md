@@ -96,7 +96,7 @@ same selection applies to human-readable and JSON output. The returned record
 includes the selected body representation, body format, participants, folder,
 message headers, relationship metadata, and attachment count.
 
-## Available Commands
+## Command Reference
 
 | Command | Purpose |
 | --- | --- |
@@ -104,13 +104,20 @@ message headers, relationship metadata, and attachment count.
 | `folders [--json]` | List indexed folder paths and stable IDs. |
 | `search QUERY [filters] [--json]` | Synchronize when needed, then run a bounded FTS5 search. |
 | `show MESSAGE_ID [--full] [--json]` | Retrieve one persisted message from SQLite; cleaned body by default. |
+| `thread MESSAGE_ID [--json]` | Reconstruct a related-message view from persisted relationship metadata. |
 | `attachments MESSAGE_ID [--json]` | List persisted attachment metadata from SQLite. |
 | `attachment ATTACHMENT_ID --output FILE` | Synchronize if needed, then extract one original attachment through its cached PST locator. |
 
 `search` filters are `--from`, `--to`, `--after`, `--before`, `--folder`,
-`--has-attachment`, and `--limit`.
+`--has-attachment`, and `--limit`. The full agent contract, including JSON
+schemas, stable ID formats, error envelopes, cache access, limits, and known
+libpff limitations, is maintained in the CLI itself. Read it before invoking a
+command:
 
-Thread reconstruction is planned but not available yet.
+```console
+$ pstq --help
+$ pstq search --help
+```
 
 ## Development
 
