@@ -536,16 +536,19 @@ def attachments(ctx: click.Context, message_id: str, json_output: bool) -> None:
     type=click.Path(dir_okay=False, path_type=str),
     help="New file path for the original attachment bytes.",
 )
+@click.option("--json", "json_output", is_flag=True, help="Render errors as JSON.")
 @click.pass_context
-def attachment(ctx: click.Context, attachment_id: str, output: str) -> None:
+def attachment(
+    ctx: click.Context, attachment_id: str, output: str, json_output: bool
+) -> None:
     """Write original attachment bytes through its cached PST traversal locator.
 
     ATTACHMENT_ID must be the STORE_UID:MESSAGE_NID:INDEX returned by
-    attachments. --output is required and names a new output file; existing
-    files may be replaced by the operating system. This command synchronizes if
-    the source changed, validates that the cached locator still reaches the
-    expected item, then opens the PST read-only to copy original bytes. It emits
-    a human-readable byte count and has no JSON success mode.
+    attachments. --output is required and must name a path that does not exist;
+    PSTQ never overwrites an existing file. This command synchronizes if the
+    source changed, validates that the cached locator still reaches the expected
+    item, then opens the PST read-only to copy original bytes. It emits a
+    human-readable byte count and has no JSON success mode.
     """
     source_path, database_path = _configured_paths(ctx)
     try:
@@ -558,6 +561,11 @@ def attachment(ctx: click.Context, attachment_id: str, output: str) -> None:
             written = extract_attachment(
                 source_path, database_path, attachment_id, output, history
             )
+    except FileExistsError as error:
+        raise CliContractError(
+            f"Output path already exists and will not be overwritten: {output}",
+            "output_exists",
+        ) from error
     except (OSError, PstReaderError, PstSynchronizationError, ValueError) as error:
         raise _command_error(error) from error
     click.echo(f"Wrote {written} bytes to {output}")

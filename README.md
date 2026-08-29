@@ -119,7 +119,7 @@ be an IANA timezone and is applied to quoted timestamps that omit an offset.
 | `show MESSAGE_ID [--full] [--json]` | Retrieve one persisted message from SQLite; cleaned body by default. |
 | `thread MESSAGE_ID [--json]` | Reconstruct a related-message view from persisted cache data. |
 | `attachments MESSAGE_ID [--json]` | List persisted attachment metadata from SQLite. |
-| `attachment ATTACHMENT_ID --output FILE` | Synchronize if needed, then extract one original attachment through its cached PST locator. |
+| `attachment ATTACHMENT_ID --output FILE` | Synchronize if needed, then extract one original attachment through its cached PST locator. `--output` must name a path that does not exist; PSTQ never overwrites an existing file. |
 
 `search` filters are `--from`, `--to`, `--after`, `--before`, `--folder`,
 `--has-attachment`, `--from-owner`, and `--limit`. The full agent contract,

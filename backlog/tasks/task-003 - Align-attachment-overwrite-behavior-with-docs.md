@@ -1,9 +1,10 @@
 ---
 id: TASK-003
 title: Align attachment overwrite behavior with docs
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-08-29 15:25'
+updated_date: '2026-08-29 17:44'
 labels:
   - code-review
   - bug
@@ -40,22 +41,38 @@ code, command help, and README agree, then classify the error accordingly.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The attachment overwrite contract is defined once and documented identically in command help and README
-- [ ] #2 The implementation matches the documented contract
-- [ ] #3 When the output path already exists (if rejection is chosen), the failure returns a distinct, accurate error code rather than source_error
-- [ ] #4 Tests cover the existing-output-path case and assert the chosen behavior and error envelope
+- [x] #1 The attachment overwrite contract is defined once and documented identically in command help and README
+- [x] #2 The implementation matches the documented contract
+- [x] #3 When the output path already exists (if rejection is chosen), the failure returns a distinct, accurate error code rather than source_error
+- [x] #4 Tests cover the existing-output-path case and assert the chosen behavior and error envelope
 <!-- AC:END -->
 
 ## Implementation Plan
 
 <!-- SECTION:PLAN:BEGIN -->
-1. Confirm the intended behavior for an existing output path (reject is the current safe default).
-2. Add a dedicated exception/error code for output-path conflicts and stop mapping it to source_error.
-3. Correct the `attachment` command help and the README Command Reference.
-4. Add tests for both the fresh-write and existing-path cases, including the JSON error envelope.
+1. Retain exclusive output creation so attachment extraction never overwrites an existing file.
+2. Map FileExistsError before the general OSError classification to the dedicated output_exists CLI error, with an output-specific message.
+3. State the no-overwrite contract identically in attachment help and the README command reference.
+4. Add regression coverage for the retained reader behavior and the CLI human and JSON error envelopes, then run targeted and full checks.
 <!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
+<!-- SECTION:NOTES:BEGIN -->
+
+Validated the attachment help text directly with `uv run pstq attachment --help`; it states the same no-overwrite contract as README.md. `tests/test_pst.py::test_attachment_metadata_and_locator_extraction_use_anonymous_fixture` verifies exclusive creation preserves the original output. `tests/test_pstq.py::test_attachment_command_rejects_existing_output_path` verifies text and JSON failures use output_exists. Full validation: `uv run tox` passed lint, formatting, mypy, 127 tests, and 100% coverage.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Retained safe exclusive attachment output creation and documented that existing output paths are never overwritten. Added attachment --json error support and mapped output conflicts to the output_exists error envelope.
+
+Verification: `uv run tox` passed lint, formatting, mypy, 127 tests, and 100% coverage. No ADRs or follow-up tasks were needed.
+<!-- SECTION:FINAL_SUMMARY:END -->
+
+Investigation confirmed PstReader.extract_attachment uses exclusive "xb" creation and cleans only files it created after a failed write. The CLI currently classifies FileExistsError as source_error because it checks OSError broadly. The attachment command does not advertise --json, but its group-level failure renderer emits JSON when --json is present; task-007 separately covers broader no-command/JSON UX.
+<!-- SECTION:NOTES:END -->
+
 <!-- SECTION:NOTES:END -->

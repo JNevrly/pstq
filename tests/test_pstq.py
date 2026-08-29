@@ -53,7 +53,7 @@ def test_command_line_interface():
     ):
         command_help = runner.invoke(cli.main, [command, "--help"])
         assert command_help.exit_code == 0
-        assert "--json" in command_help.output or command == "attachment"
+        assert "--json" in command_help.output
 
 
 def test_inspect_command_outputs_deterministic_json(monkeypatch):
@@ -670,6 +670,34 @@ def test_attachment_commands_report_errors(
     assert "missing attachment" in listed.output
     assert extracted.exit_code == 1
     assert "write failed" in extracted.output
+
+
+def test_attachment_command_rejects_existing_output_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def extract(*_: object) -> int:
+        raise FileExistsError("image.png")
+
+    monkeypatch.setattr(cli, "extract_attachment", extract)
+    config = ["--config", str(_archive_config(tmp_path))]
+    runner = CliRunner()
+
+    text_result = runner.invoke(
+        cli.main,
+        [*config, "attachment", "store:3:0", "--output", "image.png"],
+    )
+    json_result = runner.invoke(
+        cli.main,
+        [*config, "attachment", "store:3:0", "--output", "image.png", "--json"],
+    )
+
+    message = "Output path already exists and will not be overwritten: image.png"
+    assert text_result.exit_code == 1
+    assert text_result.output == f"Error: {message}\n"
+    assert json_result.exit_code == 1
+    assert json.loads(json_result.output) == {
+        "error": {"code": "output_exists", "message": message}
+    }
 
 
 def test_agent_commands_have_human_readable_output(
