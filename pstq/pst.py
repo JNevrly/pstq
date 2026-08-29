@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection, Iterator
+from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from importlib import import_module
@@ -10,6 +10,14 @@ from pathlib import Path
 from typing import Any, Protocol, Self, cast
 
 PID_TAG_RECORD_KEY = 0x0FF9
+PID_TAG_ATTACH_FILENAME = 0x3704
+PID_TAG_ATTACH_METHOD = 0x3705
+PID_TAG_ATTACH_LONG_FILENAME = 0x3707
+PID_TAG_RENDERING_POSITION = 0x370B
+PID_TAG_ATTACH_MIME_TAG = 0x370E
+PID_TAG_ATTACH_CONTENT_ID = 0x3712
+PID_TAG_ATTACH_CONTENT_LOCATION = 0x3713
+PID_TAG_ATTACHMENT_HIDDEN = 0x7FFE
 
 
 class PstReaderError(RuntimeError):
@@ -49,6 +57,21 @@ class PstStore:
 
 
 @dataclass(frozen=True)
+class PstAttachment:
+    """Metadata for one attachment without its binary payload."""
+
+    index: int
+    filename: str | None
+    mime_type: str | None
+    size: int | None
+    content_id: str | None
+    content_location: str | None
+    attachment_method: int | None
+    hidden: bool | None
+    rendering_position: int | None
+
+
+@dataclass(frozen=True)
 class PstMessage:
     """A normalized message and the mail properties pypff exposes directly."""
 
@@ -63,9 +86,11 @@ class PstMessage:
     conversation_topic: str | None
     conversation_index: str | None
     attachment_count: int
-    plain_text_body: str | None
-    rtf_body: str | None
-    html_body: str | None
+    plain_text_body: str | bytes | None
+    rtf_body: str | bytes | None
+    html_body: str | bytes | None
+    attachments: tuple[PstAttachment, ...] = ()
+    index_in_folder: int = 0
 
 
 @dataclass(frozen=True)
@@ -77,6 +102,7 @@ class PstFolder:
     name: str | None
     path: str
     messages: tuple[PstMessage, ...]
+    index_in_parent: int | None = None
 
 
 class PstReader:
@@ -168,6 +194,7 @@ class PstReader:
             root_folder,
             parent_nid=None,
             parent_path="",
+            index_in_parent=None,
             include_bodies=include_bodies,
             include_body_nids=frozenset(include_body_nids or ()),
         )
@@ -178,6 +205,7 @@ class PstReader:
         *,
         parent_nid: int | None,
         parent_path: str,
+        index_in_parent: int | None,
         include_bodies: bool,
         include_body_nids: frozenset[int],
     ) -> Iterator[PstFolder]:
@@ -188,6 +216,7 @@ class PstReader:
             self._message_from_pypff(
                 folder.get_sub_message(index),
                 folder_nid=nid,
+                index_in_folder=index,
                 include_bodies=include_bodies,
                 include_body_nids=include_body_nids,
             )
@@ -199,6 +228,7 @@ class PstReader:
             name=name,
             path=path,
             messages=messages,
+            index_in_parent=index_in_parent,
         )
 
         for index in range(folder.number_of_sub_folders):
@@ -206,6 +236,7 @@ class PstReader:
                 folder.get_sub_folder(index),
                 parent_nid=nid,
                 parent_path=path,
+                index_in_parent=index,
                 include_bodies=include_bodies,
                 include_body_nids=include_body_nids,
             )
@@ -215,6 +246,7 @@ class PstReader:
         message: Any,
         *,
         folder_nid: int,
+        index_in_folder: int,
         include_bodies: bool,
         include_body_nids: frozenset[int],
     ) -> PstMessage:
@@ -253,7 +285,150 @@ class PstReader:
                 if should_include_body
                 else None
             ),
+            attachments=self._attachments(message) if should_include_body else (),
+            index_in_folder=index_in_folder,
         )
+
+    def extract_attachment(
+        self,
+        folder_indexes: Sequence[int],
+        message_index: int,
+        message_nid: int,
+        attachment_index: int,
+        output_path: str | Path,
+    ) -> int:
+        """Write an attachment through a cached stock-pypff traversal locator."""
+        folder = self._require_open().root_folder
+        if folder is None:
+            raise PstFileUnreadableError(f"PST has no root folder: {self.path}")
+        try:
+            for folder_index in folder_indexes:
+                folder = folder.get_sub_folder(folder_index)
+            message = folder.get_sub_message(message_index)
+            if self._nid(message, "message") != message_nid:
+                raise PstReaderError(
+                    f"Cached locator does not match message {message_nid}."
+                )
+            attachment = message.get_attachment(attachment_index)
+            size = attachment.size
+        except (AttributeError, IndexError, OSError) as error:
+            raise PstReaderError(
+                f"Unable to retrieve attachment {attachment_index} "
+                f"for message {message_nid}."
+            ) from error
+        if not isinstance(size, int) or size < 0:
+            raise PstReaderError(
+                f"Attachment {attachment_index} for message {message_nid} "
+                "has no usable size."
+            )
+        destination = Path(output_path)
+        written = 0
+        try:
+            output = destination.open("xb")
+        except FileExistsError:
+            raise
+        try:
+            with output:
+                while written < size:
+                    chunk = attachment.read_buffer(min(64 * 1024, size - written))
+                    if not chunk:
+                        raise PstReaderError(
+                            f"Attachment {attachment_index} ended before "
+                            "its expected size."
+                        )
+                    output.write(chunk)
+                    written += len(chunk)
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+        return written
+
+    def _attachments(self, message: Any) -> tuple[PstAttachment, ...]:
+        count = self._optional_property(message, "number_of_attachments") or 0
+        if not isinstance(count, int) or count < 1:
+            return ()
+        attachments: list[PstAttachment] = []
+        for index in range(count):
+            try:
+                attachment = message.get_attachment(index)
+            except (AttributeError, OSError):
+                continue
+            attachments.append(
+                PstAttachment(
+                    index=index,
+                    filename=(
+                        self._attachment_text(attachment, PID_TAG_ATTACH_LONG_FILENAME)
+                        or self._attachment_text(attachment, PID_TAG_ATTACH_FILENAME)
+                    ),
+                    mime_type=self._attachment_text(
+                        attachment, PID_TAG_ATTACH_MIME_TAG
+                    ),
+                    size=self._attachment_size(attachment),
+                    content_id=self._attachment_text(
+                        attachment, PID_TAG_ATTACH_CONTENT_ID
+                    ),
+                    content_location=self._attachment_text(
+                        attachment, PID_TAG_ATTACH_CONTENT_LOCATION
+                    ),
+                    attachment_method=self._attachment_integer(
+                        attachment, PID_TAG_ATTACH_METHOD
+                    ),
+                    hidden=self._attachment_boolean(
+                        attachment, PID_TAG_ATTACHMENT_HIDDEN
+                    ),
+                    rendering_position=self._attachment_integer(
+                        attachment, PID_TAG_RENDERING_POSITION
+                    ),
+                )
+            )
+        return tuple(attachments)
+
+    def _attachment_entry(self, attachment: Any, property_tag: int) -> Any:
+        try:
+            for record_set in attachment.record_sets:
+                for entry in record_set.entries:
+                    if entry.entry_type == property_tag:
+                        return entry
+        except (AttributeError, OSError):
+            pass
+        return None
+
+    def _attachment_text(self, attachment: Any, property_tag: int) -> str | None:
+        entry = self._attachment_entry(attachment, property_tag)
+        if entry is None:
+            return None
+        try:
+            value = entry.data_as_string
+        except (AttributeError, OSError, ValueError):
+            return None
+        return value if isinstance(value, str) and value else None
+
+    def _attachment_integer(self, attachment: Any, property_tag: int) -> int | None:
+        entry = self._attachment_entry(attachment, property_tag)
+        if entry is None:
+            return None
+        try:
+            value = entry.data_as_integer
+        except (AttributeError, OSError, ValueError):
+            return None
+        return value if isinstance(value, int) else None
+
+    def _attachment_boolean(self, attachment: Any, property_tag: int) -> bool | None:
+        entry = self._attachment_entry(attachment, property_tag)
+        if entry is None:
+            return None
+        try:
+            value = entry.data_as_boolean
+        except (AttributeError, OSError, ValueError):
+            return None
+        return value if isinstance(value, bool) else None
+
+    def _attachment_size(self, attachment: Any) -> int | None:
+        try:
+            size = attachment.size
+        except (AttributeError, OSError):
+            return None
+        return size if isinstance(size, int) and size >= 0 else None
 
     def _message_store_uid(self, message_store: Any) -> str:
         if message_store is None:

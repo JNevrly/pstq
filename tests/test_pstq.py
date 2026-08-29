@@ -314,7 +314,11 @@ def test_show_command_reads_only_the_persisted_message(
     monkeypatch.setattr(
         cli,
         "get_message",
-        lambda *_: {"body": "Complete body", "id": "store:3", "subject": "Status"},
+        lambda *_, **__: {
+            "body": "Complete body",
+            "id": "store:3",
+            "subject": "Status",
+        },
     )
     monkeypatch.setattr(
         cli,
@@ -333,6 +337,103 @@ def test_show_command_reads_only_the_persisted_message(
         "id": "store:3",
         "subject": "Status",
     }
+
+
+def test_show_command_selects_cleaned_or_full_body_for_all_output_modes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    full_arguments: list[bool] = []
+
+    def get_message_with_selected_body(
+        *_: object, full: bool = False
+    ) -> dict[str, object]:
+        full_arguments.append(full)
+        return {
+            "attachment_count": 0,
+            "body": "Raw body" if full else "Clean body",
+            "date": None,
+            "folder": "Root/Inbox",
+            "from": None,
+            "id": "store:3",
+            "subject": "Status",
+            "to": [],
+        }
+
+    monkeypatch.setattr(cli, "get_message", get_message_with_selected_body)
+    config = ["--config", str(_archive_config(tmp_path)), "show", "store:3"]
+    runner = CliRunner()
+
+    cleaned_json = runner.invoke(cli.main, [*config, "--json"])
+    full_json = runner.invoke(cli.main, [*config, "--full", "--json"])
+    cleaned_text = runner.invoke(cli.main, config)
+    full_text = runner.invoke(cli.main, [*config, "--full"])
+
+    assert json.loads(cleaned_json.output)["body"] == "Clean body"
+    assert json.loads(full_json.output)["body"] == "Raw body"
+    assert cleaned_text.output.endswith("Clean body\n")
+    assert full_text.output.endswith("Raw body\n")
+    assert full_arguments == [False, True, False, True]
+
+
+def test_attachment_commands_list_metadata_and_extract_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    values = [
+        {
+            "filename": "anonymous-image.png",
+            "id": "store:3:0",
+            "mime_type": "image/png",
+            "size": 20,
+        }
+    ]
+    calls: list[tuple[str, str, str, str]] = []
+    monkeypatch.setattr(cli, "list_attachments", lambda *_: values)
+
+    def extract(source: str, database: str, attachment_id: str, output: str) -> int:
+        calls.append((source, database, attachment_id, output))
+        return 20
+
+    monkeypatch.setattr(cli, "extract_attachment", extract)
+    config = ["--config", str(_archive_config(tmp_path))]
+    runner = CliRunner()
+
+    listed = runner.invoke(cli.main, [*config, "attachments", "store:3"])
+    listed_json = runner.invoke(cli.main, [*config, "attachments", "store:3", "--json"])
+    extracted = runner.invoke(
+        cli.main,
+        [*config, "attachment", "store:3:0", "--output", "image.png"],
+    )
+
+    assert listed.output == "store:3:0  anonymous-image.png  image/png  20\n"
+    assert json.loads(listed_json.output) == values
+    assert extracted.output == "Wrote 20 bytes to image.png\n"
+    assert calls == [("archive.pst", "index.sqlite", "store:3:0", "image.png")]
+
+
+def test_attachment_commands_report_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = ["--config", str(_archive_config(tmp_path))]
+    monkeypatch.setattr(
+        cli,
+        "list_attachments",
+        lambda *_: (_ for _ in ()).throw(ValueError("missing attachment")),
+    )
+    listed = CliRunner().invoke(cli.main, [*config, "attachments", "store:3"])
+    monkeypatch.setattr(
+        cli,
+        "extract_attachment",
+        lambda *_: (_ for _ in ()).throw(OSError("write failed")),
+    )
+    extracted = CliRunner().invoke(
+        cli.main,
+        [*config, "attachment", "store:3:0", "--output", "image.png"],
+    )
+
+    assert listed.exit_code == 1
+    assert "missing attachment" in listed.output
+    assert extracted.exit_code == 1
+    assert "write failed" in extracted.output
 
 
 def test_agent_commands_have_human_readable_output(
@@ -379,7 +480,7 @@ def test_agent_commands_have_human_readable_output(
     monkeypatch.setattr(
         cli,
         "get_message",
-        lambda *_: {
+        lambda *_, **__: {
             "attachment_count": 0,
             "body": "Complete body",
             "date": None,
@@ -428,7 +529,7 @@ def test_agent_commands_report_cache_and_search_errors(
     monkeypatch.setattr(
         cli,
         "get_message",
-        lambda *_: (_ for _ in ()).throw(ValueError("missing message")),
+        lambda *_, **__: (_ for _ in ()).throw(ValueError("missing message")),
     )
     show = CliRunner().invoke(cli.main, [*config, "show", "store:3"])
     missing_config = CliRunner().invoke(cli.main, ["status"])

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -10,13 +11,68 @@ from datetime import UTC, datetime
 from email import policy
 from email.parser import HeaderParser
 from email.utils import getaddresses
+from html.parser import HTMLParser
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import cast
 
-from pstq.pst import PstFolder, PstMessage, PstReader
+from pstq.pst import PstAttachment, PstFolder, PstMessage, PstReader
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 5
+CLEANER_VERSION = 2
+
+_ORIGINAL_MESSAGE_SEPARATOR = re.compile(
+    r"^-----Original Message-----\s*$", re.IGNORECASE
+)
+_OUTLOOK_HEADER = re.compile(r"^(From|Sent|To|Cc|Subject):\s+\S.*", re.IGNORECASE)
+_HTML_BLOCK_TAGS = frozenset(
+    {"address", "blockquote", "br", "div", "hr", "li", "p", "pre", "tr"}
+)
+
+
+class _HtmlBodyRenderer(HTMLParser):
+    """Convert message HTML to bounded text without fetching external resources."""
+
+    def __init__(self, attachment_ids: dict[str, str]) -> None:
+        super().__init__(convert_charrefs=True)
+        self._attachment_ids = attachment_ids
+        self._parts: list[str] = []
+        self._ignored_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in {"script", "style"}:
+            self._ignored_depth += 1
+            return
+        if self._ignored_depth:
+            return
+        if tag in _HTML_BLOCK_TAGS:
+            self._newline()
+        if tag == "img":
+            self._parts.append(
+                _image_marker(dict(attrs).get("src"), self._attachment_ids)
+            )
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style"} and self._ignored_depth:
+            self._ignored_depth -= 1
+        elif not self._ignored_depth and tag in _HTML_BLOCK_TAGS:
+            self._newline()
+
+    def handle_data(self, data: str) -> None:
+        if not self._ignored_depth:
+            self._parts.append(data)
+
+    def _newline(self) -> None:
+        if self._parts and not self._parts[-1].endswith("\n"):
+            self._parts.append("\n")
+
+    def rendered(self) -> str:
+        return "\n".join(
+            " ".join(line.split()) for line in "".join(self._parts).splitlines()
+        ).strip()
 
 
 class PstSynchronizationError(RuntimeError):
@@ -85,6 +141,7 @@ class _IndexState:
     source: _SourceState
     store_uid: str
     schema_version: int
+    cleaner_version: int
     generation: int
 
 
@@ -116,7 +173,11 @@ def sync_pst(
         return _full_sync(source_path, target)
 
     state = _read_index_state(target)
-    if state is None or state.schema_version != SCHEMA_VERSION:
+    if (
+        state is None
+        or state.schema_version != SCHEMA_VERSION
+        or state.cleaner_version != CLEANER_VERSION
+    ):
         return _full_sync(source_path, target)
 
     source = _source_state(source_path)
@@ -157,12 +218,14 @@ def index_status(
             source is not None
             and state is not None
             and state.schema_version == SCHEMA_VERSION
+            and state.cleaner_version == CLEANER_VERSION
             and state.source == source
         ),
         "index_exists": Path(database_path).is_file(),
         "index_path": database_path,
         "last_successful_sync": last_successful_sync,
         "schema_version": state.schema_version if state else None,
+        "cleaner_version": state.cleaner_version if state else None,
         "source_error": source_error,
         "source_mtime_ns": source.mtime_ns if source else None,
         "source_path": source_path,
@@ -289,8 +352,10 @@ def search_messages(
     ]
 
 
-def get_message(database_path: str | Path, message_id: str) -> dict[str, object]:
-    """Return a complete persisted message without opening its source PST."""
+def get_message(
+    database_path: str | Path, message_id: str, *, full: bool = False
+) -> dict[str, object]:
+    """Return a persisted message with its cleaned body unless FULL is requested."""
     store_uid, nid = _parse_record_id(message_id)
     state = _require_index_state(database_path)
     if store_uid != state.store_uid:
@@ -305,7 +370,8 @@ def get_message(database_path: str | Path, message_id: str) -> dict[str, object]
                    message.internet_message_id, message.in_reply_to,
                    message.references_header, message.conversation_topic,
                    message.conversation_index, message.attachment_count,
-                   message.body_raw, message.body_format, folder.path
+                   message.body_raw, message.body_clean, message.body_format,
+                   folder.path
             FROM message
             JOIN folder ON folder.store_uid = message.store_uid
                        AND folder.nid = message.folder_nid
@@ -318,14 +384,14 @@ def get_message(database_path: str | Path, message_id: str) -> dict[str, object]
         recipients = _recipients_for_messages(connection, store_uid, ((nid,),))[nid]
     return {
         "attachment_count": row[13],
-        "body": _sqlite_optional_text(row[14]),
-        "body_format": _sqlite_optional_text(row[15]),
+        "body": _sqlite_optional_text(row[14] if full else row[15]),
+        "body_format": _sqlite_optional_text(row[16]),
         "client_submit_time": _sqlite_optional_text(row[5]),
         "conversation_index": _sqlite_optional_text(row[12]),
         "conversation_topic": _sqlite_optional_text(row[11]),
         "date": _sqlite_optional_text(row[6] or row[5]),
         "delivery_time": _sqlite_optional_text(row[6]),
-        "folder": _sqlite_optional_text(row[16]),
+        "folder": _sqlite_optional_text(row[17]),
         "folder_id": _record_id(store_uid, row[1]),
         "from": _sqlite_optional_text(row[4]),
         "id": message_id,
@@ -337,6 +403,124 @@ def get_message(database_path: str | Path, message_id: str) -> dict[str, object]
         "to": list(recipients),
         "transport_headers": _sqlite_optional_text(row[7]),
     }
+
+
+def list_attachments(
+    database_path: str | Path, message_id: str
+) -> list[dict[str, object]]:
+    """Return persisted attachment metadata without opening the source PST."""
+    store_uid, message_nid = _parse_record_id(message_id)
+    state = _require_index_state(database_path)
+    if store_uid != state.store_uid:
+        raise ValueError(f"Message ID does not belong to this index: {message_id}")
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT index_in_message, filename, mime_type, size, content_id,
+                   content_location, attachment_method, hidden, rendering_position
+            FROM attachment
+            WHERE store_uid = ? AND message_nid = ?
+            ORDER BY index_in_message
+            """,
+            (store_uid, message_nid),
+        ).fetchall()
+    return [
+        {
+            "attachment_method": row[6],
+            "content_id": _sqlite_optional_text(row[4]),
+            "content_location": _sqlite_optional_text(row[5]),
+            "filename": _sqlite_optional_text(row[1]),
+            "hidden": bool(row[7]) if row[7] is not None else None,
+            "id": _attachment_id(store_uid, message_nid, row[0]),
+            "mime_type": _sqlite_optional_text(row[2]),
+            "rendering_position": row[8],
+            "size": row[3],
+        }
+        for row in rows
+    ]
+
+
+def extract_attachment(
+    source_path: str | Path,
+    database_path: str | Path,
+    attachment_id: str,
+    output_path: str | Path,
+) -> int:
+    """Extract one persisted attachment through a cached traversal locator."""
+    store_uid, message_nid, attachment_index = _parse_attachment_id(attachment_id)
+    sync_pst(source_path, database_path)
+    state = _require_index_state(database_path)
+    if store_uid != state.store_uid:
+        raise ValueError(
+            f"Attachment ID does not belong to this index: {attachment_id}"
+        )
+    with sqlite3.connect(database_path) as connection:
+        exists = connection.execute(
+            """
+            SELECT 1 FROM attachment
+            WHERE store_uid = ? AND message_nid = ? AND index_in_message = ?
+            """,
+            (store_uid, message_nid, attachment_index),
+        ).fetchone()
+    if exists is None:
+        raise ValueError(f"Attachment not found: {attachment_id}")
+    with PstReader(source_path) as reader:
+        if reader.store.uid != state.store_uid:
+            raise PstSynchronizationError("PST store does not match this index.")
+        with sqlite3.connect(database_path) as connection:
+            folder_indexes, message_index = _message_locator(
+                connection, store_uid, message_nid
+            )
+        return reader.extract_attachment(
+            folder_indexes,
+            message_index,
+            message_nid,
+            attachment_index,
+            output_path,
+        )
+
+
+def _message_locator(
+    connection: sqlite3.Connection, store_uid: str, message_nid: int
+) -> tuple[tuple[int, ...], int]:
+    row = connection.execute(
+        """
+        SELECT folder_nid, index_in_folder
+        FROM message WHERE store_uid = ? AND nid = ?
+        """,
+        (store_uid, message_nid),
+    ).fetchone()
+    if row is None or not isinstance(row[1], int) or row[1] < 0:
+        raise ValueError(
+            f"No usable locator for message: {_record_id(store_uid, message_nid)}"
+        )
+
+    folder_nid = row[0]
+    folder_indexes: list[int] = []
+    visited: set[int] = set()
+    while True:
+        if folder_nid in visited:
+            raise ValueError(f"Invalid folder ancestry for message: {message_nid}")
+        visited.add(folder_nid)
+        folder = connection.execute(
+            """
+            SELECT parent_nid, index_in_parent
+            FROM folder WHERE store_uid = ? AND nid = ?
+            """,
+            (store_uid, folder_nid),
+        ).fetchone()
+        if folder is None:
+            raise ValueError(f"Invalid folder ancestry for message: {message_nid}")
+        parent_nid, index_in_parent = folder
+        if parent_nid is None:
+            if index_in_parent is not None:
+                raise ValueError(f"Invalid folder ancestry for message: {message_nid}")
+            break
+        if not isinstance(index_in_parent, int) or index_in_parent < 0:
+            raise ValueError(f"Invalid folder ancestry for message: {message_nid}")
+        folder_indexes.append(index_in_parent)
+        folder_nid = parent_nid
+    return tuple(reversed(folder_indexes)), row[1]
 
 
 def _full_sync(source_path: str | Path, target: Path) -> SyncResult:
@@ -440,7 +624,7 @@ def _apply_metadata_scan(
         for message in folder.messages:
             existing = connection.execute(
                 """
-                SELECT modification_time, folder_nid
+                SELECT modification_time, folder_nid, index_in_folder
                 FROM message WHERE store_uid = ? AND nid = ?
                 """,
                 (store_uid, message.nid),
@@ -452,15 +636,24 @@ def _apply_metadata_scan(
             elif existing[0] != modification_time:
                 modified_count += 1
                 body_nids.add(message.nid)
-            elif existing[1] != message.folder_nid:
+            elif (
+                existing[1] != message.folder_nid
+                or existing[2] != message.index_in_folder
+            ):
                 moved_count += 1
                 connection.execute(
                     """
                     UPDATE message
-                    SET folder_nid = ?, last_seen_generation = ?
+                    SET folder_nid = ?, index_in_folder = ?, last_seen_generation = ?
                     WHERE store_uid = ? AND nid = ?
                     """,
-                    (message.folder_nid, generation, store_uid, message.nid),
+                    (
+                        message.folder_nid,
+                        message.index_in_folder,
+                        generation,
+                        store_uid,
+                        message.nid,
+                    ),
                 )
                 continue
             else:
@@ -537,6 +730,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             source_mtime_ns INTEGER NOT NULL,
             store_uid TEXT NOT NULL REFERENCES store(uid),
             schema_version INTEGER NOT NULL,
+            cleaner_version INTEGER NOT NULL,
             last_successful_sync TEXT NOT NULL,
             generation INTEGER NOT NULL
         );
@@ -547,6 +741,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             parent_nid INTEGER,
             name TEXT,
             path TEXT NOT NULL,
+            index_in_parent INTEGER,
             last_seen_generation INTEGER NOT NULL,
             PRIMARY KEY (store_uid, nid)
         );
@@ -568,7 +763,9 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             conversation_index TEXT,
             attachment_count INTEGER NOT NULL,
             body_raw TEXT,
+            body_clean TEXT,
             body_format TEXT,
+            index_in_folder INTEGER NOT NULL,
             last_seen_generation INTEGER NOT NULL,
             PRIMARY KEY (store_uid, nid),
             FOREIGN KEY (store_uid, folder_nid) REFERENCES folder(store_uid, nid)
@@ -592,6 +789,11 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             filename TEXT,
             mime_type TEXT,
             size INTEGER,
+            content_id TEXT,
+            content_location TEXT,
+            attachment_method INTEGER,
+            hidden INTEGER,
+            rendering_position INTEGER,
             PRIMARY KEY (store_uid, message_nid, index_in_message),
             FOREIGN KEY (store_uid, message_nid) REFERENCES message(store_uid, nid)
         );
@@ -615,12 +817,14 @@ def _upsert_folder(
     connection.execute(
         """
         INSERT INTO folder (
-            store_uid, nid, parent_nid, name, path, last_seen_generation
-        ) VALUES (?, ?, ?, ?, ?, ?)
+            store_uid, nid, parent_nid, name, path, index_in_parent,
+            last_seen_generation
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(store_uid, nid) DO UPDATE SET
             parent_nid = excluded.parent_nid,
             name = excluded.name,
             path = excluded.path,
+            index_in_parent = excluded.index_in_parent,
             last_seen_generation = excluded.last_seen_generation
         """,
         (
@@ -629,6 +833,7 @@ def _upsert_folder(
             folder.parent_nid,
             folder.name,
             folder.path,
+            folder.index_in_parent,
             generation,
         ),
     )
@@ -648,8 +853,9 @@ def _upsert_message(
             store_uid, nid, folder_nid, modification_time, subject, sender_name,
             client_submit_time, delivery_time, transport_headers, internet_message_id,
             in_reply_to, references_header, conversation_topic, conversation_index,
-            attachment_count, body_raw, body_format, last_seen_generation
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            attachment_count, body_raw, body_clean, body_format, index_in_folder,
+            last_seen_generation
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(store_uid, nid) DO UPDATE SET
             folder_nid = excluded.folder_nid,
             modification_time = excluded.modification_time,
@@ -665,7 +871,9 @@ def _upsert_message(
             conversation_index = excluded.conversation_index,
             attachment_count = excluded.attachment_count,
             body_raw = excluded.body_raw,
+            body_clean = excluded.body_clean,
             body_format = excluded.body_format,
+            index_in_folder = excluded.index_in_folder,
             last_seen_generation = excluded.last_seen_generation
         """,
         (
@@ -685,11 +893,26 @@ def _upsert_message(
             message.conversation_index,
             message.attachment_count,
             body_raw,
+            clean_body(
+                _render_body(
+                    body_raw,
+                    body_format,
+                    {
+                        _normalize_content_id(attachment.content_id): _attachment_id(
+                            store_uid, message.nid, attachment.index
+                        )
+                        for attachment in message.attachments
+                        if attachment.content_id
+                    },
+                )
+            ),
             body_format,
+            message.index_in_folder,
             generation,
         ),
     )
     _replace_recipients(connection, store_uid, message.nid, message.transport_headers)
+    _replace_attachments(connection, store_uid, message.nid, message.attachments)
     _index_message(connection, store_uid, message.nid)
 
 
@@ -728,7 +951,7 @@ def _read_status_state(database_path: Path) -> tuple[_IndexState | None, str | N
             row = connection.execute(
                 """
                 SELECT source_path, source_size, source_mtime_ns, store_uid,
-                       schema_version, generation, last_successful_sync
+                       schema_version, cleaner_version, generation, last_successful_sync
                 FROM index_state WHERE singleton = 1
                 """
             ).fetchone()
@@ -737,8 +960,10 @@ def _read_status_state(database_path: Path) -> tuple[_IndexState | None, str | N
     if row is None:
         return None, None
     return (
-        _IndexState(_SourceState(row[0], row[1], row[2]), row[3], row[4], row[5]),
-        row[6],
+        _IndexState(
+            _SourceState(row[0], row[1], row[2]), row[3], row[4], row[5], row[6]
+        ),
+        row[7],
     )
 
 
@@ -752,14 +977,15 @@ def _write_index_state(
         """
         INSERT INTO index_state (
             singleton, source_path, source_size, source_mtime_ns, store_uid,
-            schema_version, last_successful_sync, generation
-        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+            schema_version, cleaner_version, last_successful_sync, generation
+        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(singleton) DO UPDATE SET
             source_path = excluded.source_path,
             source_size = excluded.source_size,
             source_mtime_ns = excluded.source_mtime_ns,
             store_uid = excluded.store_uid,
             schema_version = excluded.schema_version,
+            cleaner_version = excluded.cleaner_version,
             last_successful_sync = excluded.last_successful_sync,
             generation = excluded.generation
         """,
@@ -769,6 +995,7 @@ def _write_index_state(
             source.mtime_ns,
             store_uid,
             SCHEMA_VERSION,
+            CLEANER_VERSION,
             datetime.now(UTC).isoformat(),
             generation,
         ),
@@ -791,7 +1018,7 @@ def _cache_counts(
     return folder_count, message_count
 
 
-def _select_body(message: PstMessage) -> tuple[str | None, str | None]:
+def _select_body(message: PstMessage) -> tuple[str | bytes | None, str | None]:
     for body, body_format in (
         (message.plain_text_body, "plain"),
         (message.html_body, "html"),
@@ -800,6 +1027,78 @@ def _select_body(message: PstMessage) -> tuple[str | None, str | None]:
         if body is not None:
             return body, body_format
     return None, None
+
+
+def clean_body(body: str | bytes | None) -> str | None:
+    """Remove only unambiguous Outlook quoted history from a message body."""
+    if body is None:
+        return None
+    if isinstance(body, bytes):
+        body = _decode_sqlite_text(body)
+    lines = body.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        is_separator = _ORIGINAL_MESSAGE_SEPARATOR.fullmatch(line.strip())
+        if is_separator or _is_outlook_header_block(lines, index):
+            return "".join(lines[:index])
+    return body
+
+
+def _render_body(
+    body: str | bytes | None, body_format: str | None, attachment_ids: dict[str, str]
+) -> str | bytes | None:
+    if body is None or body_format != "html":
+        return body
+    if isinstance(body, bytes):
+        body = _decode_sqlite_text(body)
+    renderer = _HtmlBodyRenderer(attachment_ids)
+    renderer.feed(body)
+    renderer.close()
+    return renderer.rendered()
+
+
+def _image_marker(source: str | None, attachment_ids: dict[str, str]) -> str:
+    if not source:
+        return "[image: missing source]"
+    source = source.strip()
+    if source.casefold().startswith("cid:"):
+        content_id = _normalize_content_id(source[4:])
+        attachment_id = attachment_ids.get(content_id)
+        return (
+            f"[attachment: {attachment_id}]"
+            if attachment_id
+            else f"[image: unresolved cid:{_bounded(source[4:])}]"
+        )
+    if source.casefold().startswith("data:"):
+        return "[image: embedded data]"
+    return f"[image: remote {_bounded(source)}]"
+
+
+def _normalize_content_id(value: str) -> str:
+    return value.strip().strip("<>").casefold()
+
+
+def _bounded(value: str, limit: int = 120) -> str:
+    return value if len(value) <= limit else f"{value[:limit]}..."
+
+
+def _is_outlook_header_block(lines: list[str], start: int) -> bool:
+    """Recognize the ordered, populated English Outlook reply header block."""
+    expected = iter(("from", "sent", "to"))
+    for label in expected:
+        if start >= len(lines):
+            return False
+        match = _OUTLOOK_HEADER.fullmatch(lines[start].strip())
+        if match is None or match[1].casefold() != label:
+            return False
+        start += 1
+    if start < len(lines):
+        match = _OUTLOOK_HEADER.fullmatch(lines[start].strip())
+        if match is not None and match[1].casefold() == "cc":
+            start += 1
+    if start >= len(lines):
+        return False
+    match = _OUTLOOK_HEADER.fullmatch(lines[start].strip())
+    return match is not None and match[1].casefold() == "subject"
 
 
 def _relationships(headers: str | None) -> dict[str, str | None]:
@@ -847,10 +1146,46 @@ def _replace_recipients(
     )
 
 
+def _replace_attachments(
+    connection: sqlite3.Connection,
+    store_uid: str,
+    message_nid: int,
+    attachments: tuple[PstAttachment, ...],
+) -> None:
+    connection.execute(
+        "DELETE FROM attachment WHERE store_uid = ? AND message_nid = ?",
+        (store_uid, message_nid),
+    )
+    connection.executemany(
+        """
+        INSERT INTO attachment (
+            store_uid, message_nid, index_in_message, filename, mime_type, size,
+            content_id, content_location, attachment_method, hidden, rendering_position
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                store_uid,
+                message_nid,
+                attachment.index,
+                attachment.filename,
+                attachment.mime_type,
+                attachment.size,
+                attachment.content_id,
+                attachment.content_location,
+                attachment.attachment_method,
+                attachment.hidden,
+                attachment.rendering_position,
+            )
+            for attachment in attachments
+        ],
+    )
+
+
 def _index_message(connection: sqlite3.Connection, store_uid: str, nid: int) -> None:
     row = connection.execute(
         """
-        SELECT message.rowid, message.subject, message.sender_name, message.body_raw,
+        SELECT message.rowid, message.subject, message.sender_name, message.body_clean,
                group_concat(
                    TRIM(
                        COALESCE(recipient.name || ' ', '')
@@ -904,13 +1239,21 @@ def _recipients_for_messages(
 
 def _require_index_state(database_path: str | Path) -> _IndexState:
     state = _read_index_state(Path(database_path))
-    if state is None or state.schema_version != SCHEMA_VERSION:
+    if (
+        state is None
+        or state.schema_version != SCHEMA_VERSION
+        or state.cleaner_version != CLEANER_VERSION
+    ):
         raise ValueError("No current SQLite index is available.")
     return state
 
 
 def _record_id(store_uid: str, nid: int) -> str:
     return f"{store_uid}:{nid}"
+
+
+def _attachment_id(store_uid: str, message_nid: int, attachment_index: int) -> str:
+    return f"{store_uid}:{message_nid}:{attachment_index}"
 
 
 def _parse_record_id(value: str) -> tuple[str, int]:
@@ -921,6 +1264,23 @@ def _parse_record_id(value: str) -> tuple[str, int]:
         return store_uid, int(nid_text)
     except ValueError as error:
         raise ValueError(f"Invalid message ID: {value}") from error
+
+
+def _parse_attachment_id(value: str) -> tuple[str, int, int]:
+    message_id, separator, attachment_index_text = value.rpartition(":")
+    if not separator:
+        raise ValueError(f"Invalid attachment ID: {value}")
+    try:
+        store_uid, message_nid = _parse_record_id(message_id)
+    except ValueError as error:
+        raise ValueError(f"Invalid attachment ID: {value}") from error
+    try:
+        attachment_index = int(attachment_index_text)
+    except ValueError as error:
+        raise ValueError(f"Invalid attachment ID: {value}") from error
+    if attachment_index < 0:
+        raise ValueError(f"Invalid attachment ID: {value}")
+    return store_uid, message_nid, attachment_index
 
 
 def _decode_sqlite_text(value: bytes) -> str:

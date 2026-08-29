@@ -13,8 +13,10 @@ from onacol import ConfigManager, ConfigValidationError  # type: ignore[import-u
 
 from pstq.index import (
     PstSynchronizationError,
+    extract_attachment,
     get_message,
     index_status,
+    list_attachments,
     list_folders,
     search_messages,
     sync_pst,
@@ -245,13 +247,21 @@ def search(
 
 @main.command()
 @click.argument("message_id")
+@click.option(
+    "--full",
+    "full_body",
+    is_flag=True,
+    help="Show the original raw body instead of cleaned content.",
+)
 @click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
 @click.pass_context
-def show(ctx: click.Context, message_id: str, json_output: bool) -> None:
-    """Display one complete persisted message without opening the PST."""
+def show(
+    ctx: click.Context, message_id: str, full_body: bool, json_output: bool
+) -> None:
+    """Display one persisted message with cleaned content by default."""
     _, database_path = _configured_paths(ctx)
     try:
-        message = get_message(database_path, message_id)
+        message = get_message(database_path, message_id, full=full_body)
     except (OSError, ValueError) as error:
         raise click.ClickException(str(error)) from error
     if json_output:
@@ -269,6 +279,46 @@ def show(ctx: click.Context, message_id: str, json_output: bool) -> None:
         click.echo(f"{label}: {message[key]}")
     click.echo()
     click.echo(cast(str | None, message["body"]) or "")
+
+
+@main.command()
+@click.argument("message_id")
+@click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
+@click.pass_context
+def attachments(ctx: click.Context, message_id: str, json_output: bool) -> None:
+    """List persisted attachment metadata without opening the PST."""
+    _, database_path = _configured_paths(ctx)
+    try:
+        values = list_attachments(database_path, message_id)
+    except (OSError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
+    if json_output:
+        click.echo(_json(values), nl=False)
+        return
+    for value in values:
+        click.echo(
+            f"{value['id']}  {value['filename'] or ''}  "
+            f"{value['mime_type'] or ''}  {value['size'] or 0}"
+        )
+
+
+@main.command()
+@click.argument("attachment_id")
+@click.option(
+    "--output",
+    required=True,
+    type=click.Path(dir_okay=False, path_type=str),
+    help="New file path for the original attachment bytes.",
+)
+@click.pass_context
+def attachment(ctx: click.Context, attachment_id: str, output: str) -> None:
+    """Write original attachment bytes through a cached PST locator."""
+    source_path, database_path = _configured_paths(ctx)
+    try:
+        written = extract_attachment(source_path, database_path, attachment_id, output)
+    except (OSError, PstReaderError, PstSynchronizationError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
+    click.echo(f"Wrote {written} bytes to {output}")
 
 
 def _configured_paths(ctx: click.Context) -> tuple[str, str]:

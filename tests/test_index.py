@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from pstq import index
-from pstq.pst import PstFolder, PstMessage, PstStore
+from pstq.pst import PstAttachment, PstFolder, PstMessage, PstStore
 
 REAL_SOURCE_STATE = index._source_state
 
@@ -20,9 +20,10 @@ def _message(
     *,
     nid: int = 3,
     folder_nid: int = 2,
-    plain_text_body: str | None = "Plain body",
-    html_body: str | None = "<p>HTML body</p>",
-    rtf_body: str | None = "RTF body",
+    plain_text_body: str | bytes | None = "Plain body",
+    html_body: str | bytes | None = "<p>HTML body</p>",
+    rtf_body: str | bytes | None = "RTF body",
+    attachments: tuple[PstAttachment, ...] = (),
     modification_time: datetime = datetime(2026, 8, 20, 12, 30),
 ) -> PstMessage:
     return PstMessage(
@@ -44,6 +45,7 @@ def _message(
         plain_text_body=plain_text_body,
         rtf_body=rtf_body,
         html_body=html_body,
+        attachments=attachments,
     )
 
 
@@ -52,6 +54,7 @@ class FakeReader:
     error: Exception | None = None
     store_uid = "store"
     walk_arguments: list[dict[str, object]] = []
+    attachment_calls: list[tuple[tuple[int, ...], int, int, int, Path]] = []
 
     def __init__(self, _: str | Path) -> None:
         self.store = PstStore(self.store_uid)
@@ -79,6 +82,26 @@ class FakeReader:
         if self.error is not None:
             raise self.error
 
+    def extract_attachment(
+        self,
+        folder_indexes: tuple[int, ...],
+        message_index: int,
+        message_nid: int,
+        attachment_index: int,
+        output_path: Path,
+    ) -> int:
+        self.attachment_calls.append(
+            (
+                folder_indexes,
+                message_index,
+                message_nid,
+                attachment_index,
+                output_path,
+            )
+        )
+        output_path.write_bytes(b"anonymous attachment")
+        return len(b"anonymous attachment")
+
 
 def _records(*messages: PstMessage) -> tuple[PstFolder, ...]:
     return (
@@ -95,6 +118,7 @@ def _records(*messages: PstMessage) -> tuple[PstFolder, ...]:
             name="Inbox",
             path="Root/Inbox",
             messages=messages,
+            index_in_parent=0,
         ),
     )
 
@@ -104,6 +128,7 @@ def fake_reader(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeReader.error = None
     FakeReader.store_uid = "store"
     FakeReader.walk_arguments = []
+    FakeReader.attachment_calls = []
     FakeReader.folders = _records(_message())
     monkeypatch.setattr(index, "PstReader", FakeReader)
     source = [index._SourceState("archive.pst", 1, 1)]
@@ -127,18 +152,19 @@ def test_import_pst_creates_normalized_cache(tmp_path: Path) -> None:
     assert _rows(database_path, "SELECT uid FROM store") == [("store",)]
     assert _rows(
         database_path,
-        "SELECT store_uid, nid, parent_nid, name, path FROM folder ORDER BY nid",
+        "SELECT store_uid, nid, parent_nid, name, path, index_in_parent "
+        "FROM folder ORDER BY nid",
     ) == [
-        ("store", 1, None, "Root", "Root"),
-        ("store", 2, 1, "Inbox", "Root/Inbox"),
+        ("store", 1, None, "Root", "Root", None),
+        ("store", 2, 1, "Inbox", "Root/Inbox", 0),
     ]
     assert _rows(
         database_path,
         """
         SELECT nid, folder_nid, modification_time, subject, sender_name,
-               client_submit_time, delivery_time, body_raw, body_format,
+               client_submit_time, delivery_time, body_raw, body_clean, body_format,
                internet_message_id, in_reply_to, references_header,
-               conversation_topic, conversation_index, attachment_count
+               conversation_topic, conversation_index, attachment_count, index_in_folder
         FROM message
         """,
     ) == [
@@ -151,6 +177,7 @@ def test_import_pst_creates_normalized_cache(tmp_path: Path) -> None:
             "2026-08-20T12:00:00",
             "2026-08-20T12:30:00",
             "Plain body",
+            "Plain body",
             "plain",
             "<message@example.test>",
             "<parent@example.test>",
@@ -158,6 +185,7 @@ def test_import_pst_creates_normalized_cache(tmp_path: Path) -> None:
             "Status",
             "010203",
             1,
+            0,
         )
     ]
     assert _rows(database_path, "SELECT * FROM recipient") == []
@@ -193,6 +221,286 @@ def test_import_pst_selects_the_best_available_body(
     assert _rows(database_path, "SELECT body_raw, body_format FROM message") == [
         expected
     ]
+
+
+def test_import_pst_renders_html_with_safe_image_markers(tmp_path: Path) -> None:
+    attachment = PstAttachment(
+        index=0,
+        filename="chart.png",
+        mime_type="image/png",
+        size=12,
+        content_id="<chart@example.test>",
+        content_location=None,
+        attachment_method=1,
+        hidden=True,
+        rendering_position=None,
+    )
+    FakeReader.folders = _records(
+        _message(
+            plain_text_body=None,
+            html_body=(
+                "<p>Current update <img src='cid:chart@example.test'></p>"
+                "<img src='https://example.test/" + "a" * 121 + "'>"
+                "<img src='data:image/png;base64,secret'><img src='cid:missing'>"
+                "<script>hidden()</script>"
+                "<p>-----Original Message-----</p><p>Quoted</p>"
+            ),
+            attachments=(attachment,),
+        )
+    )
+    database_path = tmp_path / "index.sqlite"
+
+    index.import_pst("archive.pst", database_path)
+
+    assert _rows(database_path, "SELECT body_clean FROM message") == [
+        (
+            "Current update [attachment: store:3:0]\n"
+            "[image: remote "
+            + index._bounded("https://example.test/" + "a" * 121)
+            + "][image: embedded data][image: unresolved cid:missing]\n",
+        )
+    ]
+
+
+def test_html_renderer_handles_empty_and_block_tags() -> None:
+    assert index._render_body("<div>A<br>B</div><style>x</style>", "html", {}) == "A\nB"
+    assert index._render_body(b"<p>Bytes</p>", "html", {}) == "Bytes"
+    assert index._render_body("plain", "plain", {}) == "plain"
+    assert index._image_marker(None, {}) == "[image: missing source]"
+    assert index._image_marker(" CID:<MATCH> ", {"match": "store:3:0"}) == (
+        "[attachment: store:3:0]"
+    )
+    renderer = index._HtmlBodyRenderer({})
+    renderer.handle_starttag("script", [])
+    renderer.handle_starttag("p", [])
+    renderer.handle_endtag("script")
+    renderer.handle_startendtag("img", [])
+    assert renderer.rendered() == "[image: missing source]"
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (
+            "Current update.\n\n-----Original Message-----\nQuoted history.",
+            "Current update.\n\n",
+        ),
+        (
+            "Current update.\nFrom: Sender <sender@example.test>\n"
+            "Sent: Monday, August 24, 2026 9:00 AM\n"
+            "To: Recipient <recipient@example.test>\n"
+            "Cc: Copy <copy@example.test>\n"
+            "Subject: Previous update\nQuoted history.",
+            "Current update.\n",
+        ),
+    ],
+)
+def test_clean_body_removes_recognized_outlook_reply_history(
+    body: str, expected: str
+) -> None:
+    assert index.clean_body(body) == expected
+
+
+def test_clean_body_keeps_ambiguous_content_searchable(tmp_path: Path) -> None:
+    body = (
+        "Draft a header example.\nFrom: example sender\n"
+        "To: example recipient\nSubject: searchable ambiguous content"
+    )
+    FakeReader.folders = _records(_message(plain_text_body=body))
+    database_path = tmp_path / "index.sqlite"
+
+    index.import_pst("archive.pst", database_path)
+
+    assert index.clean_body(body) == body
+    assert index.clean_body("From: sender\nSent: today\nTo: recipient") == (
+        "From: sender\nSent: today\nTo: recipient"
+    )
+    assert index.clean_body("From: sender") == "From: sender"
+    assert index.search_messages(database_path, "ambiguous")
+
+
+def test_import_preserves_raw_body_and_indexes_cleaned_body(tmp_path: Path) -> None:
+    body = "Current content.\n-----Original Message-----\nQuoted content."
+    FakeReader.folders = _records(_message(plain_text_body=body))
+    database_path = tmp_path / "index.sqlite"
+
+    index.import_pst("archive.pst", database_path)
+
+    rows = _rows(database_path, "SELECT body_raw, body_clean, body_format FROM message")
+    assert rows == [(body, "Current content.\n", "plain")]
+    assert index.get_message(database_path, "store:3")["body"] == "Current content.\n"
+    assert index.get_message(database_path, "store:3", full=True)["body"] == body
+    assert index.search_messages(database_path, "Current")
+    assert index.search_messages(database_path, "Quoted") == []
+
+
+def test_import_preserves_byte_body_and_indexes_decoded_cleaned_body(
+    tmp_path: Path,
+) -> None:
+    body = b"Current content.\n-----Original Message-----\nQuoted content."
+    FakeReader.folders = _records(_message(plain_text_body=body))
+    database_path = tmp_path / "index.sqlite"
+
+    index.import_pst("archive.pst", database_path)
+
+    rows = _rows(database_path, "SELECT body_raw, body_clean, body_format FROM message")
+    assert rows == [(body, "Current content.\n", "plain")]
+    assert index.search_messages(database_path, "Current")
+    assert index.search_messages(database_path, "Quoted") == []
+
+
+def test_import_persists_attachment_metadata_and_extracts_by_stable_id(
+    tmp_path: Path,
+) -> None:
+    attachment = PstAttachment(
+        index=0,
+        filename="anonymous-photo.png",
+        mime_type="image/png",
+        size=20,
+        content_id="<photo@example.test>",
+        content_location=None,
+        attachment_method=1,
+        hidden=True,
+        rendering_position=0,
+    )
+    FakeReader.folders = _records(_message(attachments=(attachment,)))
+    database_path = tmp_path / "index.sqlite"
+    output_path = tmp_path / "photo.png"
+
+    index.import_pst("archive.pst", database_path)
+
+    assert index.list_attachments(database_path, "store:3") == [
+        {
+            "attachment_method": 1,
+            "content_id": "<photo@example.test>",
+            "content_location": None,
+            "filename": "anonymous-photo.png",
+            "hidden": True,
+            "id": "store:3:0",
+            "mime_type": "image/png",
+            "rendering_position": 0,
+            "size": 20,
+        }
+    ]
+    assert index.extract_attachment(
+        "archive.pst", database_path, "store:3:0", output_path
+    ) == len(b"anonymous attachment")
+    assert output_path.read_bytes() == b"anonymous attachment"
+    assert FakeReader.attachment_calls == [((0,), 0, 3, 0, output_path)]
+
+
+def test_attachment_extraction_synchronizes_reordered_locators(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attachment = PstAttachment(
+        0, "anonymous.png", None, 1, None, None, None, None, None
+    )
+    source = [index._SourceState("archive.pst", 1, 1)]
+    monkeypatch.setattr(index, "_source_state", lambda _: source[0])
+    database_path = tmp_path / "index.sqlite"
+    output_path = tmp_path / "anonymous.png"
+    message = _message(attachments=(attachment,))
+    FakeReader.folders = _records(message)
+
+    index.import_pst("archive.pst", database_path)
+
+    source[0] = index._SourceState("archive.pst", 2, 2)
+    FakeReader.folders = (
+        PstFolder(1, None, "Root", "Root", ()),
+        PstFolder(
+            2,
+            1,
+            "Inbox",
+            "Root/Inbox",
+            (replace(message, index_in_folder=1),),
+            index_in_parent=1,
+        ),
+    )
+
+    index.extract_attachment("archive.pst", database_path, "store:3:0", output_path)
+
+    assert FakeReader.attachment_calls == [((1,), 1, 3, 0, output_path)]
+
+
+def test_message_locator_rejects_invalid_cached_values(tmp_path: Path) -> None:
+    database_path = tmp_path / "index.sqlite"
+    index.import_pst("archive.pst", database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("UPDATE message SET index_in_folder = -1")
+        with pytest.raises(ValueError, match="No usable locator"):
+            index._message_locator(connection, "store", 3)
+
+        connection.execute("UPDATE message SET index_in_folder = 0")
+        connection.execute("UPDATE folder SET parent_nid = 2 WHERE nid = 2")
+        with pytest.raises(ValueError, match="Invalid folder ancestry"):
+            index._message_locator(connection, "store", 3)
+
+        connection.execute("UPDATE folder SET parent_nid = 1 WHERE nid = 2")
+        connection.execute("UPDATE folder SET index_in_parent = 0 WHERE nid = 1")
+        with pytest.raises(ValueError, match="Invalid folder ancestry"):
+            index._message_locator(connection, "store", 3)
+
+        connection.execute("UPDATE folder SET index_in_parent = -1 WHERE nid = 2")
+        connection.execute("UPDATE folder SET index_in_parent = NULL WHERE nid = 1")
+        with pytest.raises(ValueError, match="Invalid folder ancestry"):
+            index._message_locator(connection, "store", 3)
+
+        connection.execute("DELETE FROM folder WHERE nid = 2")
+        with pytest.raises(ValueError, match="Invalid folder ancestry"):
+            index._message_locator(connection, "store", 3)
+
+
+def test_attachment_helpers_reject_invalid_or_missing_identifiers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "index.sqlite"
+    index.import_pst("archive.pst", database_path)
+
+    with pytest.raises(ValueError, match="Invalid attachment"):
+        index.extract_attachment(
+            "archive.pst", database_path, "store:3", tmp_path / "x"
+        )
+    with pytest.raises(ValueError, match="Invalid attachment"):
+        index.extract_attachment("archive.pst", database_path, "broken", tmp_path / "x")
+    with pytest.raises(ValueError, match="Invalid attachment"):
+        index.extract_attachment(
+            "archive.pst", database_path, "store:3:nope", tmp_path / "x"
+        )
+    with pytest.raises(ValueError, match="Invalid attachment"):
+        index.extract_attachment(
+            "archive.pst", database_path, "store:3:-1", tmp_path / "x"
+        )
+    with pytest.raises(ValueError, match="Attachment not found"):
+        index.extract_attachment(
+            "archive.pst", database_path, "store:3:9", tmp_path / "x"
+        )
+    with pytest.raises(ValueError, match="does not belong"):
+        index.list_attachments(database_path, "other:3")
+    monkeypatch.setattr(
+        index,
+        "_require_index_state",
+        lambda _: index._IndexState(
+            index._SourceState("archive.pst", 1, 1), "other", 4, 1, 1
+        ),
+    )
+    with pytest.raises(ValueError, match="does not belong"):
+        index.extract_attachment(
+            "archive.pst", database_path, "store:3:0", tmp_path / "x"
+        )
+
+
+def test_attachment_extraction_rejects_a_replacement_store(tmp_path: Path) -> None:
+    attachment = PstAttachment(0, None, None, 1, None, None, None, None, None)
+    FakeReader.folders = _records(_message(attachments=(attachment,)))
+    database_path = tmp_path / "index.sqlite"
+    index.import_pst("archive.pst", database_path)
+    FakeReader.store_uid = "replacement"
+
+    with pytest.raises(index.PstSynchronizationError, match="does not match"):
+        index.extract_attachment(
+            "archive.pst", database_path, "store:3:0", tmp_path / "x"
+        )
 
 
 def test_import_pst_replaces_the_cache_only_after_a_successful_import(
@@ -259,6 +567,27 @@ def test_sync_pst_skips_traversal_when_source_metadata_is_unchanged(
     assert result.skipped is True
     assert result.full is False
     assert FakeReader.walk_arguments == []
+
+
+def test_sync_pst_rebuilds_when_the_cleaner_version_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = [index._SourceState("archive.pst", 1, 1)]
+    monkeypatch.setattr(index, "_source_state", lambda _: source[0])
+    database_path = tmp_path / "index.sqlite"
+    index.import_pst("archive.pst", database_path)
+    FakeReader.walk_arguments = []
+    monkeypatch.setattr(index, "CLEANER_VERSION", index.CLEANER_VERSION + 1)
+
+    result = index.sync_pst("archive.pst", database_path)
+
+    assert result.full is True
+    assert FakeReader.walk_arguments == [
+        {"include_bodies": True, "include_body_nids": None}
+    ]
+    assert _rows(database_path, "SELECT cleaner_version FROM index_state") == [
+        (index.CLEANER_VERSION,)
+    ]
 
 
 def test_sync_pst_reloads_only_new_and_modified_message_bodies(
@@ -591,7 +920,7 @@ def test_get_message_decodes_byte_valued_fields_for_json(tmp_path: Path) -> None
             ("store", 3, 0, "to", None, b"recipient\xff@example.test"),
         )
 
-    message = index.get_message(database_path, "store:3")
+    message = index.get_message(database_path, "store:3", full=True)
 
     assert message["body"] == "Body with invalid byte: \ufffd"
     assert message["to"] == ["recipient\ufffd@example.test"]

@@ -82,16 +82,19 @@ and prefer the `--to` filter for recipient email addresses.
 Each result has a stable `id` composed of the store UID and PST NID, for
 example `edc4f1c4c743ad49a590c83842fd889f:2128196`. Search JSON includes
 `id`, `date`, `from`, `to`, `subject`, `folder`, `snippet`, and `score`.
-Pass the selected ID to `show` to retrieve the complete persisted message:
+Pass the selected ID to `show` to retrieve the persisted message with cleaned
+body content by default:
 
 ```console
 $ pstq --config pstq.yaml show edc4f1c4c743ad49a590c83842fd889f:2128196 --json
+$ pstq --config pstq.yaml show edc4f1c4c743ad49a590c83842fd889f:2128196 --full --json
 ```
 
 `show` reads only SQLite. It does not open the PST when the cache is available.
-The returned record includes the selected body representation, body format,
-participants, folder, message headers, relationship metadata, and attachment
-count.
+Use `--full` to return the original raw body, including quoted history. The
+same selection applies to human-readable and JSON output. The returned record
+includes the selected body representation, body format, participants, folder,
+message headers, relationship metadata, and attachment count.
 
 ## Available Commands
 
@@ -100,13 +103,14 @@ count.
 | `status [--json]` | Report source and cache metadata plus freshness. |
 | `folders [--json]` | List indexed folder paths and stable IDs. |
 | `search QUERY [filters] [--json]` | Synchronize when needed, then run a bounded FTS5 search. |
-| `show MESSAGE_ID [--json]` | Retrieve one complete persisted message from SQLite. |
+| `show MESSAGE_ID [--full] [--json]` | Retrieve one persisted message from SQLite; cleaned body by default. |
+| `attachments MESSAGE_ID [--json]` | List persisted attachment metadata from SQLite. |
+| `attachment ATTACHMENT_ID --output FILE` | Synchronize if needed, then extract one original attachment through its cached PST locator. |
 
 `search` filters are `--from`, `--to`, `--after`, `--before`, `--folder`,
 `--has-attachment`, and `--limit`.
 
-Thread reconstruction and attachment metadata/extraction are planned but are
-not available yet.
+Thread reconstruction is planned but not available yet.
 
 ## Development
 

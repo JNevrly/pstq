@@ -643,7 +643,7 @@ pstq folders
 
 pstq search QUERY [filters...] [--json]
 
-pstq show MESSAGE_ID [--json]
+pstq show MESSAGE_ID [--full] [--json]
 
 pstq thread MESSAGE_ID [--json]
 
@@ -739,21 +739,18 @@ The underlying libpff C API provides lookup of an item by identifier/NID.
 
 Current `pypff` should be checked because its Python wrapper may not expose the equivalent direct `get_item_by_identifier()` method.
 
-If the binding does not expose it, preferred solution:
-
-> add a very small Python binding exposing the existing libpff item-by-NID lookup.
-
-This would allow:
+If the binding does not expose it, persist a traversal locator while indexing:
 
 ```text
 CLI message ID
     ↓
-(store UID, NID)
+(store UID, folder child-index path, message index, expected NID)
     ↓
-direct PST item lookup
+bounded stock-pypff folder/message traversal
 ```
 
-which is particularly useful for retrieving attachment bytes.
+Validate the reached NID before reading attachment bytes. This avoids native
+binding maintenance while keeping extraction bounded by folder depth.
 
 Do not work around this permanently by traversing the entire PST for every `show`/attachment operation.
 

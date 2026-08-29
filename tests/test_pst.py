@@ -65,6 +65,53 @@ class SparseFakeMessage(FakeMessage):
         raise OSError("missing property")
 
 
+class FakeAttachmentEntry:
+    def __init__(self, entry_type: int, value: object) -> None:
+        self.entry_type = entry_type
+        self.data_as_string = value
+        self.data_as_integer = value
+        self.data_as_boolean = value
+
+
+class FakeAttachmentRecordSet:
+    def __init__(self, entries: list[FakeAttachmentEntry]) -> None:
+        self.entries = entries
+
+
+class FakeAttachment:
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.size = len(data)
+        self.offset = 0
+        self.record_sets = [
+            FakeAttachmentRecordSet(
+                [
+                    FakeAttachmentEntry(0x3707, "anonymous-image.png"),
+                    FakeAttachmentEntry(0x370E, "image/png"),
+                    FakeAttachmentEntry(0x3712, "<image@example.test>"),
+                    FakeAttachmentEntry(0x3705, 1),
+                    FakeAttachmentEntry(0x7FFE, True),
+                    FakeAttachmentEntry(0x370B, 0),
+                ]
+            )
+        ]
+
+    def read_buffer(self, size: int) -> bytes:
+        chunk = self.data[self.offset : self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
+
+class AttachmentFakeMessage(FakeMessage):
+    def __init__(self, attachment: FakeAttachment) -> None:
+        self._attachment = attachment
+
+    def get_attachment(self, index: int) -> FakeAttachment:
+        if index != 0:
+            raise OSError("missing attachment")
+        return self._attachment
+
+
 class FakeFolder:
     def __init__(
         self,
@@ -135,13 +182,17 @@ def test_open_normalizes_record_key_and_walks_messages(tmp_path: Path) -> None:
 
     assert pypff_file.open_arguments == (str(path), "r")
     assert pypff_file.closed
-    assert [(folder.nid, folder.parent_nid, folder.path) for folder in folders] == [
-        (100, None, "Root"),
-        (101, 100, "Root/Inbox"),
+    assert [
+        (folder.nid, folder.parent_nid, folder.path, folder.index_in_parent)
+        for folder in folders
+    ] == [
+        (100, None, "Root", None),
+        (101, 100, "Root/Inbox", 0),
     ]
     message = folders[1].messages[0]
     assert message.nid == 200
     assert message.folder_nid == 101
+    assert message.index_in_folder == 0
     assert message.modification_time == datetime(2026, 8, 20, 12, 30)
     assert message.conversation_index == "010203"
     assert message.transport_headers == "Message-ID: <message@example.test>"
@@ -186,6 +237,123 @@ def test_walk_can_select_bodies_by_message_nid(tmp_path: Path) -> None:
 
     assert messages[0].plain_text_body is None
     assert messages[1].plain_text_body == "Plain body"
+
+
+def test_attachment_metadata_and_locator_extraction_use_anonymous_fixture(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "archive.pst"
+    path.touch()
+    attachment = FakeAttachment(b"anonymous image bytes")
+    message = AttachmentFakeMessage(attachment)
+    pypff_file = FakePypffFile(b"store")
+    pypff_file.root_folder._folders[0]._messages = [message]
+    output = tmp_path / "image.png"
+
+    with PstReader(path, pypff_module=FakePypff(pypff_file)) as reader:
+        indexed = list(reader.walk(include_bodies=True))[1].messages[0]
+        written = reader.extract_attachment((0,), 0, message.identifier, 0, output)
+
+        with pytest.raises(FileExistsError):
+            reader.extract_attachment((0,), 0, message.identifier, 0, output)
+
+    assert indexed.attachments[0].filename == "anonymous-image.png"
+    assert indexed.attachments[0].content_id == "<image@example.test>"
+    assert indexed.attachments[0].hidden is True
+    assert written == len(b"anonymous image bytes")
+    assert output.read_bytes() == b"anonymous image bytes"
+
+
+def test_attachment_adapter_handles_unavailable_metadata_and_invalid_streams(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "archive.pst"
+    path.touch()
+    reader = PstReader(path, pypff_module=FakePypff(FakePypffFile(b"store")))
+
+    class MissingAttachment:
+        number_of_attachments = 0
+
+    class BrokenAttachment:
+        @property
+        def record_sets(self) -> tuple[()]:
+            raise OSError("unavailable")
+
+        @property
+        def size(self) -> int:
+            raise OSError("unavailable")
+
+    assert reader._attachments(MissingAttachment()) == ()
+    assert reader._attachment_entry(BrokenAttachment(), 1) is None
+    assert reader._attachment_text(BrokenAttachment(), 1) is None
+    assert reader._attachment_integer(BrokenAttachment(), 1) is None
+    assert reader._attachment_boolean(BrokenAttachment(), 1) is None
+    assert reader._attachment_size(BrokenAttachment()) is None
+
+
+def test_attachment_extraction_rejects_invalid_locators_and_removes_partial_output(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "archive.pst"
+    path.touch()
+    attachment = FakeAttachment(b"short")
+    attachment.size = 9
+    message = AttachmentFakeMessage(attachment)
+    pypff_file = FakePypffFile(b"store")
+    pypff_file.root_folder._folders[0]._messages = [message]
+    output = tmp_path / "partial"
+
+    with PstReader(path, pypff_module=FakePypff(pypff_file)) as reader:
+        with pytest.raises(pst.PstReaderError, match="does not match"):
+            reader.extract_attachment((0,), 0, 999, 0, tmp_path / "mismatch")
+        with pytest.raises(pst.PstReaderError, match="ended"):
+            reader.extract_attachment((0,), 0, message.identifier, 0, output)
+
+    assert not output.exists()
+
+
+def test_attachment_extraction_rejects_missing_metadata_values(tmp_path: Path) -> None:
+    path = tmp_path / "archive.pst"
+    path.touch()
+
+    class BadEntry:
+        entry_type = 1
+
+        @property
+        def data_as_string(self) -> str:
+            raise ValueError("bad")
+
+        @property
+        def data_as_integer(self) -> int:
+            raise ValueError("bad")
+
+        @property
+        def data_as_boolean(self) -> bool:
+            raise ValueError("bad")
+
+    class BadAttachment:
+        record_sets = [FakeAttachmentRecordSet([BadEntry()])]
+        size = "bad"
+
+    reader = PstReader(path, pypff_module=FakePypff(FakePypffFile(b"store")))
+    assert reader._attachment_text(BadAttachment(), 1) is None
+    assert reader._attachment_integer(BadAttachment(), 1) is None
+    assert reader._attachment_boolean(BadAttachment(), 1) is None
+    assert reader._attachment_size(BadAttachment()) is None
+
+    pypff_file = FakePypffFile(b"store")
+    pypff_file.root_folder._folders[0]._messages = [object()]  # type: ignore[list-item]
+    with PstReader(path, pypff_module=FakePypff(pypff_file)) as open_reader:
+        with pytest.raises(pst.PstReaderError, match="Unable to retrieve"):
+            open_reader.extract_attachment((0,), 0, 200, 0, tmp_path / "x")
+
+    pypff_file = FakePypffFile(b"store")
+    pypff_file.root_folder._folders[0]._messages = [
+        AttachmentFakeMessage(BadAttachment())  # type: ignore[arg-type]
+    ]
+    with PstReader(path, pypff_module=FakePypff(pypff_file)) as open_reader:
+        with pytest.raises(pst.PstReaderError, match="usable size"):
+            open_reader.extract_attachment((0,), 0, 200, 0, tmp_path / "x")
 
 
 def test_walk_ignores_unavailable_optional_message_properties(tmp_path: Path) -> None:
@@ -273,6 +441,8 @@ def test_reader_requires_an_open_file_and_root_folder(tmp_path: Path) -> None:
     pypff_file.root_folder = None
     with pytest.raises(PstFileUnreadableError, match="no root folder"):
         list(reader.walk())
+    with pytest.raises(PstFileUnreadableError, match="no root folder"):
+        reader.extract_attachment((), 0, 200, 0, tmp_path / "attachment")
     reader.close()
 
 
