@@ -102,3 +102,5 @@ alabaster
 
 # temporary files
 temp/
+test.json
+test_config.yaml
