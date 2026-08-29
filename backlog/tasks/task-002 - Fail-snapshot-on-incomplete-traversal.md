@@ -1,15 +1,20 @@
 ---
 id: TASK-002
 title: Fail snapshot on incomplete traversal
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@opencode'
 created_date: '2026-08-29 15:25'
+updated_date: '2026-08-29 17:38'
 labels:
   - code-review
   - bug
 dependencies: []
 references:
   - PST Search CLI — Implementation Brief.md
+modified_files:
+  - pstq/cli.py
+  - tests/test_pstq.py
 priority: high
 type: bug
 ordinal: 2000
@@ -38,22 +43,33 @@ the durable-artifact path (`snapshot`).
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 snapshot refuses to write (or exits non-zero) when the underlying traversal recorded any scan error
-- [ ] #2 The failure is reported through the standard CLI error contract, including a specific error code in --json mode
-- [ ] #3 A successful snapshot is written only when traversal completed without recorded errors
-- [ ] #4 Tests cover a traversal that fails part-way and assert no partial snapshot file is left behind
+- [x] #1 snapshot refuses to write (or exits non-zero) when the underlying traversal recorded any scan error
+- [x] #2 The failure is reported through the standard CLI error contract, including a specific error code in --json mode
+- [x] #3 A successful snapshot is written only when traversal completed without recorded errors
+- [x] #4 Tests cover a traversal that fails part-way and assert no partial snapshot file is left behind
 <!-- AC:END -->
 
 ## Implementation Plan
 
 <!-- SECTION:PLAN:BEGIN -->
-1. Surface `scan_errors` from `inspect_pst` to the `snapshot` command.
-2. Raise a CLI contract error before writing when `scan_errors` is non-empty, and avoid leaving a partial output file.
-3. Decide whether `inspect` should keep tolerating scan errors (diagnostic) while `snapshot` treats them as fatal.
-4. Add regression tests using a fake reader that raises mid-walk.
+1. Inspect the established CLI error contract and snapshot tests.
+2. Make snapshot reject inspections with recorded scan errors before any file write.
+3. Add a regression test for an interrupted traversal that proves no snapshot artifact remains.
+4. Run focused and full test checks, then prepare the task for review.
 <!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
+Investigation: inspect_pst intentionally retains traversal failures in Inspection.scan_errors; inspect displays them diagnostically. snapshot currently writes report.snapshot unconditionally. Expected CLI failures use CliContractError and CliContractGroup emits its code in JSON mode, so snapshot must reject scan errors before calling write_snapshot. The snapshot command also needs to accept --json for this runtime error to reach the JSON contract.
+
+Validation: uv run pytest --cov=pstq tests/ passed (126 tests, 100% coverage); uv run ruff check . passed; uv run ruff format --check . passed; uv run mypy pstq passed. The regression test invokes snapshot after a report with a recorded mid-traversal OSError and verifies exit code 1, incomplete_traversal in JSON output, and that the requested snapshot file does not exist.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Snapshot now refuses inspections with recorded scan errors before writing. It reports incomplete traversal through the standard CLI error contract using the incomplete_traversal JSON code, while successful scans retain their existing write behavior. Verified by the full 126-test suite at 100% coverage plus Ruff format/lint and mypy. No follow-up tasks or ADRs.
+<!-- SECTION:FINAL_SUMMARY:END -->
+
 <!-- SECTION:NOTES:END -->

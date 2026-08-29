@@ -122,6 +122,7 @@ def test_get_config_template(tmp_path):
 def test_snapshot_command_writes_metadata(monkeypatch):
     class Report:
         message_count = 3
+        scan_errors = ()
         snapshot = object()
 
     written = []
@@ -140,6 +141,7 @@ def test_snapshot_command_writes_metadata(monkeypatch):
 def test_snapshot_command_reports_write_errors(monkeypatch):
     class Report:
         message_count = 3
+        scan_errors = ()
         snapshot = object()
 
     def raise_write_error(*_: object) -> None:
@@ -152,6 +154,34 @@ def test_snapshot_command_reports_write_errors(monkeypatch):
 
     assert result.exit_code == 1
     assert "Error: disk full" in result.output
+
+
+def test_snapshot_command_refuses_incomplete_traversal_without_writing(
+    monkeypatch, tmp_path
+):
+    class Report:
+        message_count = 2
+        scan_errors = ("OSError: bad item",)
+        snapshot = object()
+
+    output = tmp_path / "snapshot.json"
+    monkeypatch.setattr(cli, "inspect_pst", lambda *_args, **_kwargs: Report())
+
+    result = CliRunner().invoke(
+        cli.main, ["snapshot", "archive.pst", str(output), "--json"]
+    )
+
+    assert result.exit_code == 1
+    assert not output.exists()
+    assert json.loads(result.output) == {
+        "error": {
+            "code": "incomplete_traversal",
+            "message": (
+                "Snapshot not written because PST traversal was incomplete: "
+                "OSError: bad item"
+            ),
+        }
+    }
 
 
 def test_compare_snapshots_command_outputs_json_and_human_summary(

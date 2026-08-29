@@ -204,15 +204,24 @@ def inspect(path: str, sample_size: int, json_output: bool) -> None:
 @main.command()
 @click.argument("path", type=click.Path(path_type=str))
 @click.argument("output", type=click.Path(path_type=str, dir_okay=False))
-def snapshot(path: str, output: str) -> None:
+@click.option("--json", "json_output", is_flag=True, help="Render errors as JSON.")
+def snapshot(path: str, output: str, json_output: bool) -> None:
     """Write a body-free metadata snapshot for PATH to OUTPUT.
 
     PATH is opened read-only. OUTPUT is JSON with format_version, store_uid,
     folders [{nid, path}], and messages [{nid, folder_nid, modification_time}].
     This diagnostic command writes OUTPUT and does not use archive.index_path.
+    It refuses to write a snapshot when traversal was incomplete. --json renders
+    failures using the standard CLI error contract.
     """
     try:
         report = inspect_pst(path, sample_size=0)
+        if report.scan_errors:
+            raise CliContractError(
+                "Snapshot not written because PST traversal was incomplete: "
+                + "; ".join(report.scan_errors),
+                "incomplete_traversal",
+            )
         write_snapshot(report.snapshot, output)
     except (OSError, PstReaderError, ValueError) as error:
         raise _command_error(error) from error
