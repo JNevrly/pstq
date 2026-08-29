@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import replace
 from datetime import datetime
@@ -485,3 +486,192 @@ def test_source_state_records_resolved_path_and_stat_metadata(tmp_path: Path) ->
     assert state.path == str(source.resolve())
     assert state.size == 3
     assert state.mtime_ns == source.stat().st_mtime_ns
+
+
+def test_index_queries_searchable_messages_and_persisted_records(
+    tmp_path: Path,
+) -> None:
+    message = replace(
+        _message(plain_text_body="Capon calibration is ready."),
+        transport_headers=(
+            "Message-ID: <message@example.test>\n"
+            "To: Recipient <recipient@example.test>\n"
+            "Cc: Copy <copy@example.test>\n"
+        ),
+    )
+    FakeReader.folders = _records(message)
+    database_path = tmp_path / "index.sqlite"
+    index.import_pst("archive.pst", database_path)
+
+    results = index.search_messages(
+        database_path,
+        "Capon",
+        sender="sender",
+        recipient="recipient@example.test",
+        after="2026-08-20T00:00:00",
+        before="2026-08-21T00:00:00",
+        folder="Root/Inbox",
+        has_attachment=True,
+        limit=1,
+    )
+
+    assert results[0].as_dict() == {
+        "date": "2026-08-20T12:30:00",
+        "folder": "Root/Inbox",
+        "from": "Sender",
+        "id": "store:3",
+        "score": results[0].score,
+        "snippet": "Capon calibration is ready.",
+        "subject": "Status update",
+        "to": ["recipient@example.test", "copy@example.test"],
+    }
+    assert results[0].score > 0
+    assert index.search_messages(database_path, "Recipient")
+    assert index.list_folders(database_path) == [
+        {"id": "store:1", "name": "Root", "parent_id": None, "path": "Root"},
+        {
+            "id": "store:2",
+            "name": "Inbox",
+            "parent_id": "store:1",
+            "path": "Root/Inbox",
+        },
+    ]
+    assert index.get_message(database_path, "store:3")["body"] == (
+        "Capon calibration is ready."
+    )
+    assert index.get_message(database_path, "store:3")["to"] == [
+        "recipient@example.test",
+        "copy@example.test",
+    ]
+
+
+def test_search_rejects_invalid_fts_syntax(tmp_path: Path) -> None:
+    database_path = tmp_path / "index.sqlite"
+    index.import_pst("archive.pst", database_path)
+
+    with pytest.raises(ValueError, match="Invalid FTS query"):
+        index.search_messages(database_path, '"')
+
+
+def test_search_replaces_invalid_utf8_in_fts_snippets(tmp_path: Path) -> None:
+    database_path = tmp_path / "index.sqlite"
+    index.import_pst("archive.pst", database_path)
+    with sqlite3.connect(database_path) as connection:
+        rowid = connection.execute(
+            "SELECT rowid FROM message WHERE store_uid = ? AND nid = ?", ("store", 3)
+        ).fetchone()[0]
+        connection.execute("DELETE FROM message_fts WHERE rowid = ?", (rowid,))
+        connection.execute(
+            """
+            INSERT INTO message_fts (rowid, subject, sender, recipients, body)
+            VALUES (?, '', '', '', CAST(X'63686f636f6c61746520ff' AS TEXT))
+            """,
+            (rowid,),
+        )
+
+    results = index.search_messages(database_path, "chocolate")
+
+    assert results[0].snippet == "chocolate \ufffd"
+
+
+def test_get_message_decodes_byte_valued_fields_for_json(tmp_path: Path) -> None:
+    database_path = tmp_path / "index.sqlite"
+    index.import_pst("archive.pst", database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE message SET body_raw = ? WHERE store_uid = ? AND nid = ?",
+            (b"Body with invalid byte: \xff", "store", 3),
+        )
+        connection.execute(
+            """
+            INSERT INTO recipient (
+                store_uid, message_nid, recipient_index, recipient_type, name, email
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ("store", 3, 0, "to", None, b"recipient\xff@example.test"),
+        )
+
+    message = index.get_message(database_path, "store:3")
+
+    assert message["body"] == "Body with invalid byte: \ufffd"
+    assert message["to"] == ["recipient\ufffd@example.test"]
+    json.dumps(message)
+
+
+def test_index_status_reports_freshness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = [index._SourceState("archive.pst", 1, 1)]
+    monkeypatch.setattr(index, "_source_state", lambda _: source[0])
+    database_path = tmp_path / "index.sqlite"
+    index.import_pst("archive.pst", database_path)
+
+    assert index.index_status("archive.pst", database_path)["fresh"] is True
+    source[0] = index._SourceState("archive.pst", 2, 2)
+
+    assert index.index_status("archive.pst", database_path)["fresh"] is False
+
+
+def test_index_status_reports_unavailable_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        index,
+        "_source_state",
+        lambda _: (_ for _ in ()).throw(OSError("unavailable")),
+    )
+
+    report = index.index_status("archive.pst", tmp_path / "missing.sqlite")
+
+    assert report["fresh"] is False
+    assert report["source_error"] == "unavailable"
+
+
+def test_query_helpers_reject_missing_or_invalid_records(tmp_path: Path) -> None:
+    database_path = tmp_path / "index.sqlite"
+    index.import_pst("archive.pst", database_path)
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        index.search_messages(database_path, " ")
+    with pytest.raises(ValueError, match="does not belong"):
+        index.get_message(database_path, "other:3")
+    with pytest.raises(ValueError, match="Message not found"):
+        index.get_message(database_path, "store:99")
+    with pytest.raises(ValueError, match="No current"):
+        index.list_folders(tmp_path / "missing.sqlite")
+    with pytest.raises(ValueError, match="Invalid message ID"):
+        index.get_message(database_path, "invalid")
+    with pytest.raises(ValueError, match="Invalid message ID"):
+        index.get_message(database_path, "store:not-a-number")
+
+
+def test_recipient_and_fts_helpers_handle_empty_records(tmp_path: Path) -> None:
+    database_path = tmp_path / "index.sqlite"
+    index.import_pst("archive.pst", database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        index._replace_recipients(connection, "store", 3, None)
+        index._index_message(connection, "store", 99)
+
+        assert index._recipients_for_messages(connection, "store", []) == {}
+
+
+def test_search_propagates_non_fts_database_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "index.sqlite"
+    index.import_pst("archive.pst", database_path)
+    real_connect = index.sqlite3.connect
+    calls = 0
+
+    def connect_with_failed_query(path: Path) -> sqlite3.Connection:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return real_connect(path)
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(index.sqlite3, "connect", connect_with_failed_query)
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        index.search_messages(database_path, "Plain")

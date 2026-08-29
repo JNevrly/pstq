@@ -1,2 +1,14 @@
 general:
     log_level: INFO  # Logging level [DEBUG, INFO, WARNING, ERROR, CRITICAL]
+
+archive:
+    pst_path:
+        oc_default: null
+        oc_schema:
+            type: string
+            nullable: true
+    index_path:
+        oc_default: null
+        oc_schema:
+            type: string
+            nullable: true

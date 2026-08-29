@@ -5,11 +5,20 @@ from __future__ import annotations
 import json
 import sys
 from importlib.resources import files
+from pathlib import Path
 from typing import Any, cast
 
 import click
 from onacol import ConfigManager, ConfigValidationError  # type: ignore[import-untyped]
 
+from pstq.index import (
+    PstSynchronizationError,
+    get_message,
+    index_status,
+    list_folders,
+    search_messages,
+    sync_pst,
+)
 from pstq.metadata import (
     SnapshotFormatError,
     compare_snapshots,
@@ -22,7 +31,10 @@ from pstq.pst import PstReaderError
 DEFAULT_CONFIG_FILE = str(files("pstq").joinpath("default_config.yaml"))
 
 
-@click.group(invoke_without_command=True)
+@click.group(
+    invoke_without_command=True,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
 @click.option(
     "--config",
     type=click.Path(exists=True),
@@ -55,6 +67,7 @@ def main(ctx: click.Context, config: str | None, get_config_template: Any) -> No
         click.secho("<----------------Configuration problem---------------->", fg="red")
         click.secho(str(error), fg="red", err=True)
         sys.exit(1)
+    ctx.obj = config_manager.config
 
 
 @main.command()
@@ -129,6 +142,146 @@ def compare_snapshots_command(before: str, after: str, json_output: bool) -> Non
         click.echo(f"{category}: {count}")
     suspicious = cast(dict[str, object], comparison["suspicious_identity"])
     click.echo(f"store UID changed: {suspicious['store_uid_changed']}")
+
+
+@main.command()
+@click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
+@click.pass_context
+def status(ctx: click.Context, json_output: bool) -> None:
+    """Report configured source and SQLite index freshness."""
+    source_path, database_path = _configured_paths(ctx)
+    report = index_status(source_path, database_path)
+    if json_output:
+        click.echo(_json(report), nl=False)
+        return
+    for label, key in (
+        ("Fresh", "fresh"),
+        ("Source", "source_path"),
+        ("Source size", "source_size"),
+        ("Source mtime ns", "source_mtime_ns"),
+        ("Index", "index_path"),
+        ("Index exists", "index_exists"),
+        ("Store UID", "store_uid"),
+        ("Schema version", "schema_version"),
+        ("Last successful sync", "last_successful_sync"),
+    ):
+        click.echo(f"{label}: {report[key]}")
+    if report["source_error"]:
+        click.echo(f"Source error: {report['source_error']}")
+
+
+@main.command()
+@click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
+@click.pass_context
+def folders(ctx: click.Context, json_output: bool) -> None:
+    """List indexed folders with stable IDs and paths."""
+    _, database_path = _configured_paths(ctx)
+    try:
+        values = list_folders(database_path)
+    except (OSError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
+    if json_output:
+        click.echo(_json(values), nl=False)
+        return
+    for value in values:
+        click.echo(f"{value['id']}  {value['path']}")
+
+
+@main.command()
+@click.argument("query")
+@click.option("--from", "sender", help="Match the sender name.")
+@click.option("--to", "recipient", help="Match persisted recipient name or email.")
+@click.option("--after", help="Include messages on or after this ISO-8601 timestamp.")
+@click.option("--before", help="Include messages before this ISO-8601 timestamp.")
+@click.option("--folder", help="Match an exact indexed folder path.")
+@click.option("--has-attachment", is_flag=True, help="Require one or more attachments.")
+@click.option(
+    "--limit",
+    type=click.IntRange(1, 100),
+    default=20,
+    show_default=True,
+    help="Maximum results.",
+)
+@click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
+@click.pass_context
+def search(
+    ctx: click.Context,
+    query: str,
+    sender: str | None,
+    recipient: str | None,
+    after: str | None,
+    before: str | None,
+    folder: str | None,
+    has_attachment: bool,
+    limit: int,
+    json_output: bool,
+) -> None:
+    """Synchronize when needed, then search indexed message text."""
+    source_path, database_path = _configured_paths(ctx)
+    try:
+        sync_pst(source_path, database_path)
+        values = search_messages(
+            database_path,
+            query,
+            sender=sender,
+            recipient=recipient,
+            after=after,
+            before=before,
+            folder=folder,
+            has_attachment=has_attachment,
+            limit=limit,
+        )
+    except (OSError, PstReaderError, PstSynchronizationError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
+    if json_output:
+        click.echo(_json([value.as_dict() for value in values]), nl=False)
+        return
+    for value in values:
+        click.echo(
+            f"{value.id}  {value.date or ''}  {value.sender or ''}  "
+            f"{value.subject or ''}\n  {value.folder}  {value.snippet}\n"
+        )
+
+
+@main.command()
+@click.argument("message_id")
+@click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
+@click.pass_context
+def show(ctx: click.Context, message_id: str, json_output: bool) -> None:
+    """Display one complete persisted message without opening the PST."""
+    _, database_path = _configured_paths(ctx)
+    try:
+        message = get_message(database_path, message_id)
+    except (OSError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
+    if json_output:
+        click.echo(_json(message), nl=False)
+        return
+    for label, key in (
+        ("ID", "id"),
+        ("Date", "date"),
+        ("From", "from"),
+        ("To", "to"),
+        ("Subject", "subject"),
+        ("Folder", "folder"),
+        ("Attachments", "attachment_count"),
+    ):
+        click.echo(f"{label}: {message[key]}")
+    click.echo()
+    click.echo(cast(str | None, message["body"]) or "")
+
+
+def _configured_paths(ctx: click.Context) -> tuple[str, str]:
+    config = cast(dict[str, object], ctx.obj)
+    archive = cast(dict[str, object], config.get("archive", {}))
+    source_path = archive.get("pst_path")
+    database_path = archive.get("index_path")
+    if not isinstance(source_path, str) or not isinstance(database_path, str):
+        raise click.ClickException(
+            "Configure archive.pst_path and archive.index_path before using "
+            "this command."
+        )
+    return str(Path(source_path)), str(Path(database_path))
 
 
 def _json(value: Any) -> str:

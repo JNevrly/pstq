@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email import policy
 from email.parser import HeaderParser
+from email.utils import getaddresses
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import cast
 
 from pstq.pst import PstFolder, PstMessage, PstReader
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class PstSynchronizationError(RuntimeError):
@@ -42,6 +45,32 @@ class SyncResult:
     deleted_count: int
     skipped: bool
     full: bool
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    """A lightweight indexed message match suitable for search output."""
+
+    id: str
+    date: str | None
+    sender: str | None
+    recipients: tuple[str, ...]
+    subject: str | None
+    folder: str
+    snippet: str
+    score: float
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "date": self.date,
+            "folder": self.folder,
+            "from": self.sender,
+            "id": self.id,
+            "score": self.score,
+            "snippet": self.snippet,
+            "subject": self.subject,
+            "to": list(self.recipients),
+        }
 
 
 @dataclass(frozen=True)
@@ -109,6 +138,207 @@ def sync_pst(
     return result if result is not None else _full_sync(source_path, target)
 
 
+def index_status(
+    source_path: str | Path, database_path: str | Path
+) -> dict[str, object]:
+    """Return source and cache metadata without opening the PST reader."""
+    source_path = str(Path(source_path).resolve())
+    database_path = str(Path(database_path).resolve())
+    state, last_successful_sync = _read_status_state(Path(database_path))
+    try:
+        source = _source_state(source_path)
+    except OSError as error:
+        source = None
+        source_error: str | None = str(error)
+    else:
+        source_error = None
+    return {
+        "fresh": (
+            source is not None
+            and state is not None
+            and state.schema_version == SCHEMA_VERSION
+            and state.source == source
+        ),
+        "index_exists": Path(database_path).is_file(),
+        "index_path": database_path,
+        "last_successful_sync": last_successful_sync,
+        "schema_version": state.schema_version if state else None,
+        "source_error": source_error,
+        "source_mtime_ns": source.mtime_ns if source else None,
+        "source_path": source_path,
+        "source_size": source.size if source else None,
+        "store_uid": state.store_uid if state else None,
+    }
+
+
+def list_folders(database_path: str | Path) -> list[dict[str, object]]:
+    """List stable folder identifiers and paths from the current cache."""
+    state = _require_index_state(database_path)
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT nid, parent_nid, name, path
+            FROM folder
+            WHERE store_uid = ?
+            ORDER BY path, nid
+            """,
+            (state.store_uid,),
+        ).fetchall()
+    return [
+        {
+            "id": _record_id(state.store_uid, row[0]),
+            "name": row[2],
+            "parent_id": (
+                _record_id(state.store_uid, row[1]) if row[1] is not None else None
+            ),
+            "path": row[3],
+        }
+        for row in rows
+    ]
+
+
+def search_messages(
+    database_path: str | Path,
+    query: str,
+    *,
+    sender: str | None = None,
+    recipient: str | None = None,
+    after: str | None = None,
+    before: str | None = None,
+    folder: str | None = None,
+    has_attachment: bool = False,
+    limit: int = 20,
+) -> list[SearchResult]:
+    """Search indexed messages with FTS5 and structured SQL filters."""
+    if not query.strip():
+        raise ValueError("Search query must not be empty.")
+    state = _require_index_state(database_path)
+    filters = ["message_fts MATCH ?", "message.store_uid = ?"]
+    parameters: list[object] = [query, state.store_uid]
+    if sender:
+        filters.append("message.sender_name LIKE ? COLLATE NOCASE")
+        parameters.append(f"%{sender}%")
+    if recipient:
+        filters.append(
+            """
+            EXISTS (
+                SELECT 1 FROM recipient
+                WHERE recipient.store_uid = message.store_uid
+                  AND recipient.message_nid = message.nid
+                  AND (recipient.name LIKE ? COLLATE NOCASE
+                       OR recipient.email LIKE ? COLLATE NOCASE)
+            )
+            """
+        )
+        parameters.extend((f"%{recipient}%", f"%{recipient}%"))
+    if after:
+        filters.append(
+            "COALESCE(message.delivery_time, message.client_submit_time) >= ?"
+        )
+        parameters.append(after)
+    if before:
+        filters.append(
+            "COALESCE(message.delivery_time, message.client_submit_time) < ?"
+        )
+        parameters.append(before)
+    if folder:
+        filters.append("folder.path = ?")
+        parameters.append(folder)
+    if has_attachment:
+        filters.append("message.attachment_count > 0")
+
+    statement = f"""
+        SELECT message.nid, message.subject, message.sender_name,
+               COALESCE(message.delivery_time, message.client_submit_time),
+               folder.path,
+               snippet(message_fts, -1, '', '', '...', 20),
+               -bm25(message_fts)
+        FROM message_fts
+        JOIN message ON message.rowid = message_fts.rowid
+        JOIN folder ON folder.store_uid = message.store_uid
+                   AND folder.nid = message.folder_nid
+        WHERE {" AND ".join(filters)}
+        ORDER BY bm25(message_fts), message.nid
+        LIMIT ?
+    """
+    parameters.append(limit)
+    try:
+        with sqlite3.connect(database_path) as connection:
+            connection.text_factory = _decode_sqlite_text
+            rows = connection.execute(statement, parameters).fetchall()
+            recipients = _recipients_for_messages(connection, state.store_uid, rows)
+    except sqlite3.OperationalError as error:
+        if any(
+            value in str(error).lower()
+            for value in ("fts5", "syntax error", "unterminated string")
+        ):
+            raise ValueError(f"Invalid FTS query: {query}") from error
+        raise
+    return [
+        SearchResult(
+            id=_record_id(state.store_uid, row[0]),
+            subject=row[1],
+            sender=row[2],
+            date=row[3],
+            folder=row[4],
+            snippet=row[5] or "",
+            score=row[6],
+            recipients=recipients.get(row[0], ()),
+        )
+        for row in rows
+    ]
+
+
+def get_message(database_path: str | Path, message_id: str) -> dict[str, object]:
+    """Return a complete persisted message without opening its source PST."""
+    store_uid, nid = _parse_record_id(message_id)
+    state = _require_index_state(database_path)
+    if store_uid != state.store_uid:
+        raise ValueError(f"Message ID does not belong to this index: {message_id}")
+    with sqlite3.connect(database_path) as connection:
+        connection.text_factory = _decode_sqlite_text
+        row = connection.execute(
+            """
+            SELECT message.nid, message.folder_nid, message.modification_time,
+                   message.subject, message.sender_name, message.client_submit_time,
+                   message.delivery_time, message.transport_headers,
+                   message.internet_message_id, message.in_reply_to,
+                   message.references_header, message.conversation_topic,
+                   message.conversation_index, message.attachment_count,
+                   message.body_raw, message.body_format, folder.path
+            FROM message
+            JOIN folder ON folder.store_uid = message.store_uid
+                       AND folder.nid = message.folder_nid
+            WHERE message.store_uid = ? AND message.nid = ?
+            """,
+            (store_uid, nid),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Message not found: {message_id}")
+        recipients = _recipients_for_messages(connection, store_uid, ((nid,),))[nid]
+    return {
+        "attachment_count": row[13],
+        "body": _sqlite_optional_text(row[14]),
+        "body_format": _sqlite_optional_text(row[15]),
+        "client_submit_time": _sqlite_optional_text(row[5]),
+        "conversation_index": _sqlite_optional_text(row[12]),
+        "conversation_topic": _sqlite_optional_text(row[11]),
+        "date": _sqlite_optional_text(row[6] or row[5]),
+        "delivery_time": _sqlite_optional_text(row[6]),
+        "folder": _sqlite_optional_text(row[16]),
+        "folder_id": _record_id(store_uid, row[1]),
+        "from": _sqlite_optional_text(row[4]),
+        "id": message_id,
+        "in_reply_to": _sqlite_optional_text(row[9]),
+        "internet_message_id": _sqlite_optional_text(row[8]),
+        "modification_time": _sqlite_optional_text(row[2]),
+        "references": _sqlite_optional_text(row[10]),
+        "subject": _sqlite_optional_text(row[3]),
+        "to": list(recipients),
+        "transport_headers": _sqlite_optional_text(row[7]),
+    }
+
+
 def _full_sync(source_path: str | Path, target: Path) -> SyncResult:
     result = import_pst(source_path, target)
     return SyncResult(
@@ -151,6 +381,16 @@ def _incremental_sync(
             )
             _load_changed_bodies(
                 connection, source_path, store_uid, body_nids, generation
+            )
+            connection.execute(
+                """
+                DELETE FROM message_fts
+                WHERE rowid IN (
+                    SELECT rowid FROM message
+                    WHERE store_uid = ? AND last_seen_generation != ?
+                )
+                """,
+                (store_uid, generation),
             )
             deleted_count = connection.execute(
                 """
@@ -355,6 +595,13 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             PRIMARY KEY (store_uid, message_nid, index_in_message),
             FOREIGN KEY (store_uid, message_nid) REFERENCES message(store_uid, nid)
         );
+
+        CREATE VIRTUAL TABLE message_fts USING fts5(
+            subject,
+            sender,
+            recipients,
+            body
+        );
         """
     )
 
@@ -442,6 +689,8 @@ def _upsert_message(
             generation,
         ),
     )
+    _replace_recipients(connection, store_uid, message.nid, message.transport_headers)
+    _index_message(connection, store_uid, message.nid)
 
 
 def _source_state(source_path: str | Path) -> _SourceState:
@@ -469,20 +718,28 @@ def _copy_database(source: Path, target: Path) -> None:
 
 
 def _read_index_state(database_path: Path) -> _IndexState | None:
+    state, _ = _read_status_state(database_path)
+    return state
+
+
+def _read_status_state(database_path: Path) -> tuple[_IndexState | None, str | None]:
     try:
         with sqlite3.connect(database_path) as connection:
             row = connection.execute(
                 """
                 SELECT source_path, source_size, source_mtime_ns, store_uid,
-                       schema_version, generation
+                       schema_version, generation, last_successful_sync
                 FROM index_state WHERE singleton = 1
                 """
             ).fetchone()
     except sqlite3.Error:
-        return None
+        return None, None
     if row is None:
-        return None
-    return _IndexState(_SourceState(row[0], row[1], row[2]), row[3], row[4], row[5])
+        return None, None
+    return (
+        _IndexState(_SourceState(row[0], row[1], row[2]), row[3], row[4], row[5]),
+        row[6],
+    )
 
 
 def _write_index_state(
@@ -558,6 +815,125 @@ def _relationships(headers: str | None) -> dict[str, str | None]:
         "in_reply_to": parsed.get("In-Reply-To"),
         "references_header": parsed.get("References"),
     }
+
+
+def _replace_recipients(
+    connection: sqlite3.Connection,
+    store_uid: str,
+    message_nid: int,
+    headers: str | None,
+) -> None:
+    connection.execute(
+        "DELETE FROM recipient WHERE store_uid = ? AND message_nid = ?",
+        (store_uid, message_nid),
+    )
+    if headers is None:
+        return
+    parsed = HeaderParser(policy=policy.default).parsestr(headers)
+    rows: list[tuple[str, str | None, str | None]] = []
+    for recipient_type, header_name in (("to", "To"), ("cc", "Cc"), ("bcc", "Bcc")):
+        for name, email in getaddresses(parsed.get_all(header_name, ())):
+            rows.append((recipient_type, name or None, email or None))
+    connection.executemany(
+        """
+        INSERT INTO recipient (
+            store_uid, message_nid, recipient_index, recipient_type, name, email
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (store_uid, message_nid, index, recipient_type, name, email)
+            for index, (recipient_type, name, email) in enumerate(rows)
+        ],
+    )
+
+
+def _index_message(connection: sqlite3.Connection, store_uid: str, nid: int) -> None:
+    row = connection.execute(
+        """
+        SELECT message.rowid, message.subject, message.sender_name, message.body_raw,
+               group_concat(
+                   TRIM(
+                       COALESCE(recipient.name || ' ', '')
+                       || COALESCE(recipient.email, '')
+                   ),
+                   ' '
+               )
+        FROM message
+        LEFT JOIN recipient ON recipient.store_uid = message.store_uid
+                           AND recipient.message_nid = message.nid
+        WHERE message.store_uid = ? AND message.nid = ?
+        GROUP BY message.rowid
+        """,
+        (store_uid, nid),
+    ).fetchone()
+    if row is None:
+        return
+    connection.execute("DELETE FROM message_fts WHERE rowid = ?", (row[0],))
+    connection.execute(
+        """
+        INSERT INTO message_fts (rowid, subject, sender, recipients, body)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        row,
+    )
+
+
+def _recipients_for_messages(
+    connection: sqlite3.Connection,
+    store_uid: str,
+    messages: Sequence[tuple[object, ...]],
+) -> dict[int, tuple[str, ...]]:
+    nids = [cast(int, row[0]) for row in messages]
+    if not nids:
+        return {}
+    placeholders = ", ".join("?" for _ in nids)
+    rows = connection.execute(
+        f"""
+        SELECT message_nid, name, email
+        FROM recipient
+        WHERE store_uid = ? AND message_nid IN ({placeholders})
+        ORDER BY message_nid, recipient_index
+        """,
+        (store_uid, *nids),
+    ).fetchall()
+    recipients: dict[int, list[str]] = {nid: [] for nid in nids}
+    for message_nid, name, email in rows:
+        recipients[message_nid].append(_sqlite_optional_text(email or name) or "")
+    return {nid: tuple(values) for nid, values in recipients.items()}
+
+
+def _require_index_state(database_path: str | Path) -> _IndexState:
+    state = _read_index_state(Path(database_path))
+    if state is None or state.schema_version != SCHEMA_VERSION:
+        raise ValueError("No current SQLite index is available.")
+    return state
+
+
+def _record_id(store_uid: str, nid: int) -> str:
+    return f"{store_uid}:{nid}"
+
+
+def _parse_record_id(value: str) -> tuple[str, int]:
+    store_uid, separator, nid_text = value.rpartition(":")
+    if not separator or not store_uid:
+        raise ValueError(f"Invalid message ID: {value}")
+    try:
+        return store_uid, int(nid_text)
+    except ValueError as error:
+        raise ValueError(f"Invalid message ID: {value}") from error
+
+
+def _decode_sqlite_text(value: bytes) -> str:
+    """Preserve readable FTS output when a PST body contains invalid UTF-8."""
+    return value.decode("utf-8", errors="replace")
+
+
+def _sqlite_optional_text(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return _decode_sqlite_text(value)
+    return cast(str, value)
 
 
 def _format_time(value: datetime | None) -> str | None:

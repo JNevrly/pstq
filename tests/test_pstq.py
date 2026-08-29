@@ -4,12 +4,14 @@
 """Tests for the package and CLI."""
 
 import json
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 from onacol import ConfigValidationError
 
 from pstq import cli, pstq
+from pstq.index import SearchResult
 
 
 @pytest.fixture
@@ -209,3 +211,233 @@ def test_configuration_error_is_reported(monkeypatch):
     assert result.exit_code == 1
     assert "Configuration problem" in result.output
     assert "invalid config" in result.output
+
+
+def _archive_config(tmp_path: Path) -> Path:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "archive:\n  pst_path: archive.pst\n  index_path: index.sqlite\n"
+    )
+    return config_path
+
+
+def test_status_command_outputs_configured_index_metadata_as_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = {
+        "fresh": True,
+        "index_exists": True,
+        "index_path": "index.sqlite",
+        "last_successful_sync": "2026-08-20T12:30:00+00:00",
+        "schema_version": 2,
+        "source_error": None,
+        "source_mtime_ns": 2,
+        "source_path": "archive.pst",
+        "source_size": 1,
+        "store_uid": "store",
+    }
+    monkeypatch.setattr(cli, "index_status", lambda *_: report)
+
+    result = CliRunner().invoke(
+        cli.main, ["--config", str(_archive_config(tmp_path)), "status", "--json"]
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == report
+
+
+def test_search_command_synchronizes_and_returns_lightweight_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    synchronized: list[tuple[str, str]] = []
+    monkeypatch.setattr(cli, "sync_pst", lambda *paths: synchronized.append(paths))
+    monkeypatch.setattr(
+        cli,
+        "search_messages",
+        lambda *args, **kwargs: [
+            SearchResult(
+                id="store:3",
+                date="2026-08-20T12:30:00",
+                sender="Sender",
+                recipients=("recipient@example.test",),
+                subject="Status update",
+                folder="Root/Inbox",
+                snippet="Capon calibration",
+                score=1.5,
+            )
+        ],
+    )
+
+    result = CliRunner().invoke(
+        cli.main,
+        [
+            "--config",
+            str(_archive_config(tmp_path)),
+            "search",
+            "Capon",
+            "--from",
+            "Sender",
+            "--to",
+            "recipient@example.test",
+            "--after",
+            "2026-08-01",
+            "--before",
+            "2026-09-01",
+            "--folder",
+            "Root/Inbox",
+            "--has-attachment",
+            "--limit",
+            "1",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert synchronized == [("archive.pst", "index.sqlite")]
+    assert json.loads(result.output) == [
+        {
+            "date": "2026-08-20T12:30:00",
+            "folder": "Root/Inbox",
+            "from": "Sender",
+            "id": "store:3",
+            "score": 1.5,
+            "snippet": "Capon calibration",
+            "subject": "Status update",
+            "to": ["recipient@example.test"],
+        }
+    ]
+
+
+def test_show_command_reads_only_the_persisted_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "get_message",
+        lambda *_: {"body": "Complete body", "id": "store:3", "subject": "Status"},
+    )
+    monkeypatch.setattr(
+        cli,
+        "sync_pst",
+        lambda *_: (_ for _ in ()).throw(AssertionError("show must not synchronize")),
+    )
+
+    result = CliRunner().invoke(
+        cli.main,
+        ["--config", str(_archive_config(tmp_path)), "show", "store:3", "--json"],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {
+        "body": "Complete body",
+        "id": "store:3",
+        "subject": "Status",
+    }
+
+
+def test_agent_commands_have_human_readable_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "index_status",
+        lambda *_: {
+            "fresh": False,
+            "index_exists": True,
+            "index_path": "index.sqlite",
+            "last_successful_sync": None,
+            "schema_version": 2,
+            "source_error": "missing PST",
+            "source_mtime_ns": None,
+            "source_path": "archive.pst",
+            "source_size": None,
+            "store_uid": "store",
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "list_folders",
+        lambda *_: [{"id": "store:2", "path": "Root/Inbox"}],
+    )
+    monkeypatch.setattr(cli, "sync_pst", lambda *_: None)
+    monkeypatch.setattr(
+        cli,
+        "search_messages",
+        lambda *_args, **_kwargs: [
+            SearchResult(
+                id="store:3",
+                date=None,
+                sender=None,
+                recipients=(),
+                subject=None,
+                folder="Root/Inbox",
+                snippet="Capon",
+                score=1.5,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        cli,
+        "get_message",
+        lambda *_: {
+            "attachment_count": 0,
+            "body": "Complete body",
+            "date": None,
+            "folder": "Root/Inbox",
+            "from": None,
+            "id": "store:3",
+            "subject": "Status",
+            "to": [],
+        },
+    )
+    config = ["--config", str(_archive_config(tmp_path))]
+    runner = CliRunner()
+
+    status = runner.invoke(cli.main, [*config, "status"])
+    folders = runner.invoke(cli.main, [*config, "folders"])
+    folders_json = runner.invoke(cli.main, [*config, "folders", "--json"])
+    search = runner.invoke(cli.main, [*config, "search", "Capon"])
+    show = runner.invoke(cli.main, [*config, "show", "store:3"])
+
+    assert "Source error: missing PST" in status.output
+    assert folders.output == "store:2  Root/Inbox\n"
+    assert json.loads(folders_json.output) == [{"id": "store:2", "path": "Root/Inbox"}]
+    assert "store:3" in search.output
+    assert "Capon" in search.output
+    assert "Attachments: 0" in show.output
+    assert show.output.endswith("Complete body\n")
+
+
+def test_agent_commands_report_cache_and_search_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = ["--config", str(_archive_config(tmp_path))]
+    monkeypatch.setattr(
+        cli,
+        "list_folders",
+        lambda *_: (_ for _ in ()).throw(ValueError("missing cache")),
+    )
+    folders = CliRunner().invoke(cli.main, [*config, "folders"])
+    monkeypatch.setattr(cli, "sync_pst", lambda *_: None)
+    monkeypatch.setattr(
+        cli,
+        "search_messages",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("bad query")),
+    )
+    search = CliRunner().invoke(cli.main, [*config, "search", "bad"])
+    monkeypatch.setattr(
+        cli,
+        "get_message",
+        lambda *_: (_ for _ in ()).throw(ValueError("missing message")),
+    )
+    show = CliRunner().invoke(cli.main, [*config, "show", "store:3"])
+    missing_config = CliRunner().invoke(cli.main, ["status"])
+
+    assert folders.exit_code == 1
+    assert "Error: missing cache" in folders.output
+    assert search.exit_code == 1
+    assert "Error: bad query" in search.output
+    assert show.exit_code == 1
+    assert "Error: missing message" in show.output
+    assert missing_config.exit_code == 1
+    assert "Configure archive.pst_path" in missing_config.output
