@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PST Query — Code Review Summary (2026-08-29)</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --ink: #1c2530;
+    --muted: #5b6672;
+    --line: #e2e6ea;
+    --accent: #2f6f9f;
+    --high: #b3261e;
+    --medium: #b26a00;
+    --low: #3a7d34;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0 0 4rem;
+    background: var(--bg); color: var(--ink);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  header {
+    background: var(--card); border-bottom: 1px solid var(--line);
+    padding: 2rem 1.5rem;
+  }
+  .wrap { max-width: 920px; margin: 0 auto; }
+  h1 { margin: 0 0 .25rem; font-size: 1.7rem; }
+  .sub { color: var(--muted); font-size: .95rem; }
+  h2 {
+    font-size: 1.25rem; margin: 2.4rem 0 .8rem;
+    border-bottom: 2px solid var(--line); padding-bottom: .3rem;
+  }
+  h3 { font-size: 1.05rem; margin: 0 0 .3rem; }
+  p { margin: .5rem 0; }
+  code, pre {
+    font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+    font-size: .875em;
+  }
+  code { background: #eef1f4; padding: .1em .35em; border-radius: 4px; }
+  pre {
+    background: #1f2733; color: #e7ecf1; padding: .9rem 1rem;
+    border-radius: 8px; overflow-x: auto; font-size: .82rem; line-height: 1.5;
+  }
+  pre code { background: none; padding: 0; color: inherit; }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 10px; padding: 1.1rem 1.3rem; margin: 1rem 0;
+  }
+  .finding { border-left: 5px solid var(--line); }
+  .finding.high { border-left-color: var(--high); }
+  .finding.medium { border-left-color: var(--medium); }
+  .finding.low { border-left-color: var(--low); }
+  .row { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin-bottom: .4rem; }
+  .tag {
+    font-size: .72rem; text-transform: uppercase; letter-spacing: .04em;
+    font-weight: 700; padding: .12rem .5rem; border-radius: 999px; color: #fff;
+  }
+  .tag.high { background: var(--high); }
+  .tag.medium { background: var(--medium); }
+  .tag.low { background: var(--low); }
+  .tag.type { background: #55606c; }
+  .task {
+    margin-left: auto; font-size: .8rem; color: var(--muted);
+    font-family: "SF Mono", ui-monospace, monospace;
+  }
+  .loc { color: var(--muted); font-size: .82rem; font-family: "SF Mono", ui-monospace, monospace; }
+  ul { margin: .4rem 0 .4rem 1.2rem; padding: 0; }
+  li { margin: .2rem 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-size: .9rem; }
+  th, td { text-align: left; padding: .5rem .6rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  .pos { color: var(--low); font-weight: 600; }
+  .summary-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: .8rem; margin-top: 1rem; }
+  .metric { text-align: center; padding: 1rem; background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
+  .metric .n { font-size: 1.8rem; font-weight: 700; }
+  .metric .l { color: var(--muted); font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }
+  footer { color: var(--muted); font-size: .82rem; margin-top: 3rem; text-align: center; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <h1>PST Query — Code Review Summary</h1>
+    <div class="sub">Reviewer: Claude (Opus&nbsp;4.8) &nbsp;·&nbsp; Date: 2026-08-29 &nbsp;·&nbsp; Branch: <code>master</code> @ <code>8fa7345</code></div>
+    <div class="summary-grid">
+      <div class="metric"><div class="n">6</div><div class="l">Findings</div></div>
+      <div class="metric"><div class="n">1&nbsp;/&nbsp;4&nbsp;/&nbsp;1</div><div class="l">High / Med / Low</div></div>
+      <div class="metric"><div class="n">Strong</div><div class="l">Overall quality</div></div>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+<h2>Overview</h2>
+<div class="card">
+<p><strong>PST Query</strong> (<code>pstq</code>) is an offline, read-only CLI that indexes one Outlook
+PST into a disposable SQLite&nbsp;+&nbsp;FTS5 cache and exposes deterministic, agent-oriented JSON
+retrieval. The codebase is roughly 2,900 lines of source across five modules
+(<code>cli.py</code>, <code>index.py</code>, <code>pst.py</code>, <code>metadata.py</code>) with an
+equal amount of tests (~2,860 lines, 113 test functions) and a configured target of 100% coverage.</p>
+<p>This is <strong>well-engineered code</strong>. It has clear module boundaries, immutable
+dataclasses, careful separation between the read-only pypff adapter and the cache layer, atomic
+cache swaps via temp-file-and-rename, source-change detection guarding every sync, exclusive-create
+output for extracted attachments, and genuinely thorough docstrings that double as the agent
+contract. The findings below are refinements, not signs of a troubled codebase. Only one is a
+correctness bug of note, and it is confined to a diagnostic command.</p>
+<p><em>Note:</em> the review is static. The environment had no runnable Python interpreter, so the
+suite could not be executed here; the task records claim <code>uv run tox</code> passes at 100%
+coverage.</p>
+</div>
+
+<h2>What is done well</h2>
+<div class="card">
+<ul>
+  <li><span class="pos">Safety model.</span> PST is always opened read-only; the SQLite cache is explicitly disposable and rebuilt on schema/cleaner-version drift.</li>
+  <li><span class="pos">Atomicity.</span> Imports and incremental syncs write to a sibling temp DB and <code>os.replace</code> into place only after re-verifying the source is unchanged (<code>_assert_source_unchanged</code>).</li>
+  <li><span class="pos">Adapter isolation.</span> <code>pst.py</code> never leaks pypff objects; property access is defensively wrapped, and store identity is derived from <code>PidTagRecordKey</code>.</li>
+  <li><span class="pos">Determinism.</span> All JSON output is sorted-key, indented, and body-free where the contract promises it; stable <code>STORE_UID:NID</code> identifiers throughout.</li>
+  <li><span class="pos">Documentation.</span> Command docstrings specify request, result schema, limits, and source/cache access. Architectural decisions are captured as ADRs under <code>docs/adr/</code>.</li>
+</ul>
+</div>
+
+<h2>Findings</h2>
+
+<div class="card finding high">
+  <div class="row">
+    <span class="tag high">High</span><span class="tag type">Bug</span>
+    <h3>1&nbsp;· <code>snapshot</code> silently writes partial snapshots on traversal error</h3>
+    <span class="task">TASK-002</span>
+  </div>
+  <div class="loc">pstq/metadata.py — inspect_pst() · pstq/cli.py — snapshot()</div>
+  <p><code>inspect_pst</code> wraps the folder walk in a broad <code>try/except</code> that appends to
+  <code>scan_errors</code> and continues, then builds a snapshot from whatever partial data was gathered.
+  The <code>snapshot</code> command writes <code>report.snapshot</code> and prints
+  <em>"Wrote snapshot with N messages"</em> <strong>without ever checking <code>scan_errors</code></strong>.</p>
+  <p>A walk that fails part-way through a large or partly corrupt PST therefore yields a truncated
+  snapshot reported as complete. Since snapshots feed <code>compare-snapshots</code>, a truncated file
+  mis-classifies large numbers of messages as <code>missing</code>/<code>new</code> — defeating the
+  purpose of the diff. The <code>inspect</code> command prints scan errors; the durable-artifact path does not.</p>
+  <pre><code>report = inspect_pst(path, sample_size=0)
+write_snapshot(report.snapshot, output)          # scan_errors never inspected
+click.echo(f"Wrote snapshot with {report.message_count} messages to {output}")</code></pre>
+  <p><strong>Fix:</strong> refuse to write (exit non-zero, standard error envelope) when
+  <code>scan_errors</code> is non-empty; leave no partial file behind.</p>
+</div>
+
+<div class="card finding medium">
+  <div class="row">
+    <span class="tag medium">Medium</span><span class="tag type">Bug / Docs</span>
+    <h3>2&nbsp;· <code>attachment</code> overwrite behavior contradicts its documentation</h3>
+    <span class="task">TASK-003</span>
+  </div>
+  <div class="loc">pstq/pst.py:343 · pstq/cli.py:505 · README.md</div>
+  <p><code>extract_attachment</code> opens the target with exclusive creation
+  (<code>destination.open("xb")</code>) and re-raises <code>FileExistsError</code>, so an existing file is
+  <em>never</em> replaced. The command help states the opposite: <em>"names a new output file; existing
+  files may be replaced by the operating system."</em></p>
+  <p>Additionally, <code>FileExistsError</code> is an <code>OSError</code>, which the CLI maps to the
+  <code>source_error</code> code — misattributing an output-path conflict to the PST source. Pick one
+  contract (reject vs. overwrite), make code/help/README agree, and give the conflict a distinct error code.</p>
+</div>
+
+<div class="card finding medium">
+  <div class="row">
+    <span class="tag medium">Medium</span><span class="tag type">Performance</span>
+    <h3>3&nbsp;· <code>thread</code> loads the entire store to reconstruct one conversation</h3>
+    <span class="task">TASK-005</span>
+  </div>
+  <div class="loc">pstq/index.py — get_thread() / _thread_members()</div>
+  <p>Each <code>thread</code> call runs <code>SELECT … FROM message WHERE store_uid = ?</code> across
+  <em>every</em> message and builds Message-ID/reference maps and a neighbor graph in Python over the whole
+  archive. Cost is O(total messages) in time and memory per lookup, and the relationship columns are
+  unindexed. Correct, but it does not scale to large PSTs (the sample archive is ~2.4&nbsp;GB). Seed the graph
+  from a bounded candidate set (topic / conversation-index root) and/or index the relationship columns.</p>
+</div>
+
+<div class="card finding medium">
+  <div class="row">
+    <span class="tag medium">Medium</span><span class="tag type">Packaging</span>
+    <h3>4&nbsp;· <code>pypff</code> is required at runtime but undeclared; install docs mislead</h3>
+    <span class="task">TASK-006</span>
+  </div>
+  <div class="loc">pyproject.toml · uv.lock · README.md</div>
+  <p>The tool cannot touch a PST without <code>pypff</code>, yet it appears in neither
+  <code>pyproject.toml</code> nor <code>uv.lock</code>, while the README leads with <code>pip install pstq</code>.
+  Following the README yields a package that imports fine but fails at first PST access. Document the
+  libpff prerequisite and the real install path (devcontainer / pinned wheel), or declare it as a
+  dependency/extra. Also drop the stray blank lines in the pyproject <code>classifiers</code>/<code>dependencies</code> arrays.</p>
+</div>
+
+<div class="card finding medium">
+  <div class="row">
+    <span class="tag medium">Medium</span><span class="tag type">Hygiene</span>
+    <h3>5&nbsp;· Local scratch files committed to the repository</h3>
+    <span class="task">TASK-004</span>
+  </div>
+  <div class="loc">test.json · test_config.yaml</div>
+  <p><code>test.json</code> is an ~80&nbsp;KB dump of a single retrieved message including the raw HTML body
+  of what looks like a real sample-archive message; <code>test_config.yaml</code> is a developer config
+  pointing at machine-local <code>temp/</code> paths. Both are tracked at the repo root. Remove them from
+  version control and extend <code>.gitignore</code>. Prefer a sanitized template if an example config is wanted.</p>
+</div>
+
+<div class="card finding low">
+  <div class="row">
+    <span class="tag low">Low</span><span class="tag type">Polish</span>
+    <h3>6&nbsp;· Fragile <code>--json</code> error detection &amp; silent no-command invocation</h3>
+    <span class="task">TASK-007</span>
+  </div>
+  <div class="loc">pstq/cli.py — CliContractGroup / _json_requested / main()</div>
+  <p>The error-envelope format is chosen by <code>"--json" in args</code> over raw argv, decoupled from
+  Click's parsing: a positional value equal to <code>--json</code> would flip a text-mode command into JSON
+  error output. Separately, <code>invoke_without_command=True</code> with argument pass-through means running
+  <code>pstq</code> with no subcommand exits 0 silently and a mistyped command is swallowed as an onacol
+  config token. Tie format detection to the parsed option and show help/usage when no subcommand resolves.</p>
+</div>
+
+<h2>Findings at a glance</h2>
+<table>
+  <thead><tr><th>#</th><th>Finding</th><th>Severity</th><th>Type</th><th>Task</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>snapshot writes partial data on scan error</td><td><span style="color:var(--high);font-weight:600">High</span></td><td>Bug</td><td>TASK-002</td></tr>
+    <tr><td>2</td><td>attachment overwrite contract vs. docs / error code</td><td><span style="color:var(--medium);font-weight:600">Medium</span></td><td>Bug / Docs</td><td>TASK-003</td></tr>
+    <tr><td>3</td><td>thread reconstruction scans whole store</td><td><span style="color:var(--medium);font-weight:600">Medium</span></td><td>Performance</td><td>TASK-005</td></tr>
+    <tr><td>4</td><td>pypff undeclared; install docs mislead</td><td><span style="color:var(--medium);font-weight:600">Medium</span></td><td>Packaging</td><td>TASK-006</td></tr>
+    <tr><td>5</td><td>committed local scratch files</td><td><span style="color:var(--medium);font-weight:600">Medium</span></td><td>Hygiene</td><td>TASK-004</td></tr>
+    <tr><td>6</td><td>--json detection &amp; no-command UX</td><td><span style="color:var(--low);font-weight:600">Low</span></td><td>Polish</td><td>TASK-007</td></tr>
+  </tbody>
+</table>
+
+<h2>Observations (no task)</h2>
+<div class="card">
+<ul>
+  <li><strong>Body cleaner is English/Outlook-only.</strong> <code>clean_body</code> recognizes only
+  <code>-----Original Message-----</code> and English <code>From/Sent/To/Subject</code> header blocks.
+  Other locales/clients pass through uncleaned. This is an acknowledged, intentional conservative design (per TASK-001.11) — noted for awareness.</li>
+  <li><strong>Incremental sync copies the full cache each time.</strong> <code>_incremental_sync</code>
+  performs a full <code>sqlite backup</code> of the existing index before applying deltas. This is the price
+  of the atomic-swap guarantee and is safe; worth remembering for very large caches (the sample index is ~259&nbsp;MB).</li>
+  <li><strong>FTS error detection is string-based.</strong> <code>search_messages</code> classifies an FTS
+  syntax failure by substring-matching the SQLite error text. Pragmatic and adequate, but tied to message wording.</li>
+</ul>
+</div>
+
+<footer>
+  Generated as a static review of PST Query. Actionable items are tracked as TASK-002 through TASK-007 in <code>backlog/tasks/</code>.
+</footer>
+
+</main>
+</body>
+</html>
