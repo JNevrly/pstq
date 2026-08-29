@@ -493,14 +493,32 @@ def test_thread_includes_deduplicated_owner_history_and_suppresses_native_duplic
     result = index.get_thread(database_path, "store:11")
 
     recovered_records = [
-        message for message in result["messages"] if "record_type" in message
+        message for message in result["messages"] if ":q:" in str(message["id"])
     ]
-    assert [message["record_type"] for message in recovered_records] == ["recovered"]
+    assert len(recovered_records) == 1
     recovered = recovered_records[0]
     assert recovered["body"] == "Recovered contribution"
     assert recovered["date"] == "2026-08-20T10:00:00+02:00"
-    assert recovered["provenance"] == {"source_message_ids": ["store:11", "store:12"]}
-    assert index.search_messages(database_path, "Recovered") == []
+    assert recovered["folder"] == "Root/Inbox"
+    assert not {"provenance", "record_type", "relation"} & recovered.keys()
+    matches = index.search_messages(database_path, "Recovered")
+    assert [match.id for match in matches] == [recovered["id"]]
+    assert matches[0].as_dict() == {
+        "date": "2026-08-20T10:00:00+02:00",
+        "from": "Owner <owner@example.test>",
+        "id": recovered["id"],
+        "folder": "Root/Inbox",
+        "score": matches[0].score,
+        "snippet": "Recovered contribution",
+        "subject": "Re: Status",
+        "to": ["recipient@example.test"],
+    }
+    assert index.get_message(database_path, recovered["id"]) == recovered
+    assert recovered["id"] in [
+        message["id"]
+        for message in index.get_thread(database_path, recovered["id"])["messages"]
+    ]
+    assert index.list_attachments(database_path, recovered["id"]) == []
 
     FakeReader.folders = _records(
         replace(
@@ -535,6 +553,127 @@ def test_thread_includes_deduplicated_owner_history_and_suppresses_native_duplic
         "store:20",
         "store:21",
     ]
+    assert [
+        result.id for result in index.search_messages(database_path, "Recovered")
+    ] == ["store:20"]
+
+
+def test_unified_search_orders_and_filters_recovered_results(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "index.sqlite"
+    alpha = (
+        "-----Original Message-----\nFrom: Owner <owner@example.test>\n"
+        "Sent: 20.08.2026 10:00\nTo: Recipient <recipient@example.test>\n"
+        "Subject: Alpha\nCommon recovery alpha"
+    )
+    beta = (
+        "-----Original Message-----\nFrom: Owner <owner@example.test>\n"
+        "Sent: 21.08.2026 10:00\nTo: Recipient <recipient@example.test>\n"
+        "Subject: Beta\nCommon recovery beta"
+    )
+    FakeReader.folders = (
+        PstFolder(1, None, "Root", "Root", ()),
+        PstFolder(
+            2,
+            1,
+            "Inbox",
+            "Root/Inbox",
+            (
+                _message(nid=3, plain_text_body="Common native contribution"),
+                _message(nid=4, plain_text_body=f"Current\n{alpha}"),
+            ),
+            index_in_parent=0,
+        ),
+        PstFolder(
+            6,
+            1,
+            "Archive",
+            "Root/Archive",
+            (
+                _message(nid=5, folder_nid=6, plain_text_body=f"Repeated\n{alpha}"),
+                _message(nid=7, folder_nid=6, plain_text_body=f"Later\n{beta}"),
+            ),
+            index_in_parent=1,
+        ),
+    )
+    history = index.HistorySettings(("owner@example.test",), (), "Europe/Prague")
+    index.import_pst("archive.pst", database_path, history)
+
+    results = index.search_messages(database_path, "Common")
+
+    assert results == index.search_messages(database_path, "Common")
+    assert index.search_messages(database_path, "Common", limit=1) == results[:1]
+    assert len(results) == 3
+    assert {result.subject for result in results} == {"Status update", "Alpha", "Beta"}
+    by_subject = {result.subject: result for result in results}
+    assert by_subject["Alpha"].folder == "Root/Inbox"
+    assert by_subject["Beta"].folder == "Root/Archive"
+    assert [
+        result.subject
+        for result in index.search_messages(
+            database_path, "recovery", folder="Root/Inbox"
+        )
+    ] == ["Alpha"]
+    assert [
+        result.subject
+        for result in index.search_messages(
+            database_path, "recovery", folder="Root/Archive"
+        )
+    ] == ["Beta"]
+    assert [
+        result.id
+        for result in index.search_messages(
+            database_path, "Common", has_attachment=True
+        )
+    ] == ["store:3"]
+    assert {
+        result.subject
+        for result in index.search_messages(
+            database_path,
+            "recovery",
+            sender_aliases=("owner@example.test", "Owner"),
+            recipient="recipient@example.test",
+            after="2026-08-20T00:00:00",
+            before="2026-08-22T00:00:00",
+        )
+    } == {"Alpha", "Beta"}
+    with pytest.raises(ValueError, match="must not be empty"):
+        index.search_messages(database_path, " ")
+    with pytest.raises(ValueError, match="Invalid FTS query"):
+        index.search_messages(database_path, '"')
+
+
+def test_incremental_sync_removes_recovered_search_documents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = [index._SourceState("archive.pst", 1, 1)]
+    monkeypatch.setattr(index, "_source_state", lambda _: source[0])
+    database_path = tmp_path / "index.sqlite"
+    quoted = (
+        "-----Original Message-----\nFrom: Owner <owner@example.test>\n"
+        "Sent: 20.08.2026 10:00\nTo: Recipient\nSubject: Status\nRecovered"
+    )
+    history = index.HistorySettings(("owner@example.test",), (), "UTC")
+    FakeReader.folders = _records(_message(plain_text_body=f"Current\n{quoted}"))
+    index.import_pst("archive.pst", database_path, history)
+    assert index.search_messages(database_path, "Recovered")
+
+    FakeReader.folders = _records(
+        _message(
+            plain_text_body="Current without quoted history",
+            modification_time=datetime(2026, 8, 21, 12, 30),
+        )
+    )
+    source[0] = index._SourceState("archive.pst", 2, 2)
+    result = index.sync_pst("archive.pst", database_path, history)
+
+    assert result.full is False
+    assert index.search_messages(database_path, "Recovered") == []
+    assert _rows(
+        database_path,
+        "SELECT COUNT(*) FROM search_document WHERE recovered_fingerprint IS NOT NULL",
+    ) == [(0,)]
 
 
 def test_thread_parsers_ignore_malformed_values() -> None:
@@ -969,6 +1108,11 @@ def test_sync_pst_rebuilds_derived_history_when_owner_context_changes(
 
     assert result.full is True
     assert _rows(database_path, "SELECT * FROM recovered_message") == []
+    assert index.search_messages(database_path, "Recovered") == []
+    assert _rows(
+        database_path,
+        "SELECT COUNT(*) FROM search_document WHERE recovered_fingerprint IS NOT NULL",
+    ) == [(0,)]
     assert FakeReader.walk_arguments == [
         {"include_bodies": True, "include_body_nids": None}
     ]
@@ -1271,12 +1415,13 @@ def test_search_replaces_invalid_utf8_in_fts_snippets(tmp_path: Path) -> None:
     index.import_pst("archive.pst", database_path)
     with sqlite3.connect(database_path) as connection:
         rowid = connection.execute(
-            "SELECT rowid FROM message WHERE store_uid = ? AND nid = ?", ("store", 3)
+            "SELECT rowid FROM search_document WHERE store_uid = ? AND native_nid = ?",
+            ("store", 3),
         ).fetchone()[0]
-        connection.execute("DELETE FROM message_fts WHERE rowid = ?", (rowid,))
+        connection.execute("DELETE FROM search_fts WHERE rowid = ?", (rowid,))
         connection.execute(
             """
-            INSERT INTO message_fts (rowid, subject, sender, recipients, body)
+            INSERT INTO search_fts (rowid, subject, sender, recipients, body)
             VALUES (?, '', '', '', CAST(X'63686f636f6c61746520ff' AS TEXT))
             """,
             (rowid,),
@@ -1356,6 +1501,14 @@ def test_query_helpers_reject_missing_or_invalid_records(tmp_path: Path) -> None
         index.get_message(database_path, "invalid")
     with pytest.raises(ValueError, match="Invalid message ID"):
         index.get_message(database_path, "store:not-a-number")
+    with pytest.raises(ValueError, match="does not belong"):
+        index.get_message(database_path, "other:q:fingerprint")
+    with pytest.raises(ValueError, match="Message not found"):
+        index.get_message(database_path, "store:q:fingerprint")
+    with pytest.raises(ValueError, match="Message not found"):
+        index.get_thread(database_path, "store:q:fingerprint")
+    with pytest.raises(ValueError, match="does not belong"):
+        index.list_attachments(database_path, "other:q:fingerprint")
 
 
 def test_recipient_and_fts_helpers_handle_empty_records(tmp_path: Path) -> None:

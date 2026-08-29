@@ -29,7 +29,7 @@ from pstq.body import (
 )
 from pstq.pst import PstAttachment, PstFolder, PstMessage, PstReader
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
 CLEANER_VERSION = 3
 
 _ORIGINAL_MESSAGE_SEPARATOR = re.compile(
@@ -305,6 +305,7 @@ def search_messages(
     query: str,
     *,
     sender: str | None = None,
+    sender_aliases: Sequence[str] = (),
     recipient: str | None = None,
     after: str | None = None,
     before: str | None = None,
@@ -312,56 +313,49 @@ def search_messages(
     has_attachment: bool = False,
     limit: int = 20,
 ) -> list[SearchResult]:
-    """Search indexed messages with FTS5 and structured SQL filters."""
+    """Search native and recovered messages with FTS5 and structured filters."""
     if not query.strip():
         raise ValueError("Search query must not be empty.")
     state = _require_index_state(database_path)
-    filters = ["message_fts MATCH ?", "message.store_uid = ?"]
+    filters = ["search_fts MATCH ?", "search_document.store_uid = ?"]
     parameters: list[object] = [query, state.store_uid]
     if sender:
-        filters.append("message.sender_name LIKE ? COLLATE NOCASE")
+        filters.append("search_document.sender LIKE ? COLLATE NOCASE")
         parameters.append(f"%{sender}%")
-    if recipient:
+    aliases = tuple(alias for alias in sender_aliases if alias.strip())
+    if aliases:
         filters.append(
-            """
-            EXISTS (
-                SELECT 1 FROM recipient
-                WHERE recipient.store_uid = message.store_uid
-                  AND recipient.message_nid = message.nid
-                  AND (recipient.name LIKE ? COLLATE NOCASE
-                       OR recipient.email LIKE ? COLLATE NOCASE)
+            "("
+            + " OR ".join(
+                "search_document.sender_aliases LIKE ? COLLATE NOCASE" for _ in aliases
             )
-            """
+            + ")"
         )
-        parameters.extend((f"%{recipient}%", f"%{recipient}%"))
+        parameters.extend(f"%{alias}%" for alias in aliases)
+    if recipient:
+        filters.append("search_document.recipients_text LIKE ? COLLATE NOCASE")
+        parameters.append(f"%{recipient}%")
     if after:
-        filters.append(
-            "COALESCE(message.delivery_time, message.client_submit_time) >= ?"
-        )
+        filters.append("search_document.date >= ?")
         parameters.append(after)
     if before:
-        filters.append(
-            "COALESCE(message.delivery_time, message.client_submit_time) < ?"
-        )
+        filters.append("search_document.date < ?")
         parameters.append(before)
     if folder:
-        filters.append("folder.path = ?")
+        filters.append("search_document.folder_path = ?")
         parameters.append(folder)
     if has_attachment:
-        filters.append("message.attachment_count > 0")
+        filters.append("search_document.has_attachment = 1")
 
     statement = f"""
-        SELECT message.nid, message.subject, message.sender_name,
-               COALESCE(message.delivery_time, message.client_submit_time),
-               folder.path,
-               snippet(message_fts, -1, '', '', '...', 20),
-               -bm25(message_fts)
-        FROM message_fts
-        JOIN message ON message.rowid = message_fts.rowid
-        JOIN folder ON folder.store_uid = message.store_uid
-                   AND folder.nid = message.folder_nid
+        SELECT search_document.selector, search_document.subject,
+               search_document.sender, search_document.date,
+               search_document.folder_path, search_document.recipients_json,
+               snippet(search_fts, -1, '', '', '...', 20), -bm25(search_fts)
+        FROM search_fts
+        JOIN search_document ON search_document.rowid = search_fts.rowid
         WHERE {" AND ".join(filters)}
-        ORDER BY bm25(message_fts), message.nid
+        ORDER BY bm25(search_fts), search_document.selector
         LIMIT ?
     """
     parameters.append(limit)
@@ -369,7 +363,6 @@ def search_messages(
         with sqlite3.connect(database_path) as connection:
             connection.text_factory = _decode_sqlite_text
             rows = connection.execute(statement, parameters).fetchall()
-            recipients = _recipients_for_messages(connection, state.store_uid, rows)
     except sqlite3.OperationalError as error:
         if any(
             value in str(error).lower()
@@ -379,14 +372,14 @@ def search_messages(
         raise
     return [
         SearchResult(
-            id=_record_id(state.store_uid, row[0]),
+            id=_sqlite_optional_text(row[0]) or "",
             subject=row[1],
             sender=row[2],
             date=row[3],
             folder=row[4],
-            snippet=row[5] or "",
-            score=row[6],
-            recipients=recipients.get(row[0], ()),
+            snippet=row[6] or "",
+            score=row[7],
+            recipients=tuple(json.loads(_sqlite_optional_text(row[5]) or "[]")),
         )
         for row in rows
     ]
@@ -396,8 +389,35 @@ def get_message(
     database_path: str | Path, message_id: str, *, full: bool = False
 ) -> dict[str, object]:
     """Return a persisted message with its cleaned body unless FULL is requested."""
-    store_uid, nid = _parse_record_id(message_id)
     state = _require_index_state(database_path)
+    recovered = _parse_recovered_record_id(message_id)
+    if recovered is not None:
+        store_uid, fingerprint = recovered
+        if store_uid != state.store_uid:
+            raise ValueError(f"Message ID does not belong to this index: {message_id}")
+        with sqlite3.connect(database_path) as connection:
+            connection.text_factory = _decode_sqlite_text
+            row = connection.execute(
+                """
+                SELECT recovered_message.sender, recovered_message.recipients_json,
+                       recovered_message.subject, recovered_message.sent_at,
+                       recovered_message.body, search_document.folder_nid,
+                       search_document.folder_path
+                FROM recovered_message
+                JOIN search_document
+                  ON search_document.store_uid = recovered_message.store_uid
+                 AND search_document.recovered_fingerprint
+                     = recovered_message.fingerprint
+                WHERE recovered_message.store_uid = ?
+                  AND recovered_message.fingerprint = ?
+                """,
+                (store_uid, fingerprint),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"Message not found: {message_id}")
+        return _recovered_message_record(store_uid, fingerprint, row)
+
+    store_uid, nid = _parse_record_id(message_id)
     if store_uid != state.store_uid:
         raise ValueError(f"Message ID does not belong to this index: {message_id}")
     with sqlite3.connect(database_path) as connection:
@@ -427,12 +447,27 @@ def get_message(
 
 def get_thread(database_path: str | Path, message_id: str) -> dict[str, object]:
     """Return related persisted messages without opening the source PST."""
-    store_uid, anchor_nid = _parse_record_id(message_id)
     state = _require_index_state(database_path)
+    recovered = _parse_recovered_record_id(message_id)
+    if recovered is not None:
+        store_uid, fingerprint = recovered
+    else:
+        store_uid, anchor_nid = _parse_record_id(message_id)
     if store_uid != state.store_uid:
         raise ValueError(f"Message ID does not belong to this index: {message_id}")
     with sqlite3.connect(database_path) as connection:
         connection.text_factory = _decode_sqlite_text
+        if recovered is not None:
+            anchor = connection.execute(
+                """
+                SELECT canonical_source_nid FROM search_document
+                WHERE store_uid = ? AND recovered_fingerprint = ?
+                """,
+                (store_uid, fingerprint),
+            ).fetchone()
+            if anchor is None:
+                raise ValueError(f"Message not found: {message_id}")
+            anchor_nid = cast(int, anchor[0])
         relationship_rows = connection.execute(
             """
             SELECT nid, internet_message_id, in_reply_to, references_header,
@@ -469,22 +504,27 @@ def get_thread(database_path: str | Path, message_id: str) -> dict[str, object]:
         recovered_rows = connection.execute(
             f"""
             SELECT recovered_message.fingerprint, recovered_message.sender,
-                   recovered_message.sender_email, recovered_message.recipients_json,
-                   recovered_message.subject, recovered_message.sent_at,
-                   recovered_message.sent_raw, recovered_message.body,
-                   recovered_message.relation, quote_occurrence.source_message_nid
+                    recovered_message.recipients_json, recovered_message.subject,
+                    recovered_message.sent_at, recovered_message.body,
+                    search_document.folder_nid, search_document.folder_path
             FROM recovered_message
-            JOIN quote_occurrence
-              ON quote_occurrence.store_uid = recovered_message.store_uid
-             AND quote_occurrence.recovered_fingerprint = recovered_message.fingerprint
+            JOIN search_document
+              ON search_document.store_uid = recovered_message.store_uid
+             AND search_document.recovered_fingerprint = recovered_message.fingerprint
             WHERE recovered_message.store_uid = ?
-              AND quote_occurrence.source_message_nid IN ({placeholders})
-            ORDER BY recovered_message.fingerprint, quote_occurrence.source_message_nid
+              AND EXISTS (
+                  SELECT 1 FROM quote_occurrence
+                  WHERE quote_occurrence.store_uid = recovered_message.store_uid
+                    AND quote_occurrence.recovered_fingerprint
+                        = recovered_message.fingerprint
+                    AND quote_occurrence.source_message_nid IN ({placeholders})
+              )
+            ORDER BY recovered_message.fingerprint
             """,
             (store_uid, *nids),
         ).fetchall()
     records = [_message_record(store_uid, row, recipients[row[0]]) for row in rows]
-    records.extend(_recovered_records(store_uid, recovered_rows))
+    records.extend(_recovered_message_records(store_uid, recovered_rows))
     records.sort(key=_record_order)
     return {
         "id": message_id,
@@ -527,8 +567,14 @@ def list_attachments(
     database_path: str | Path, message_id: str
 ) -> list[dict[str, object]]:
     """Return persisted attachment metadata without opening the source PST."""
-    store_uid, message_nid = _parse_record_id(message_id)
     state = _require_index_state(database_path)
+    recovered = _parse_recovered_record_id(message_id)
+    if recovered is not None:
+        store_uid, _ = recovered
+        if store_uid != state.store_uid:
+            raise ValueError(f"Message ID does not belong to this index: {message_id}")
+        return []
+    store_uid, message_nid = _parse_record_id(message_id)
     if store_uid != state.store_uid:
         raise ValueError(f"Message ID does not belong to this index: {message_id}")
     with sqlite3.connect(database_path) as connection:
@@ -688,15 +734,15 @@ def _incremental_sync(
             _load_changed_bodies(
                 connection, source_path, store_uid, body_nids, generation
             )
-            connection.execute(
+            _delete_search_documents(
+                connection,
                 """
-                DELETE FROM message_fts
-                WHERE rowid IN (
-                    SELECT rowid FROM message
+                store_uid = ? AND native_nid IN (
+                    SELECT nid FROM message
                     WHERE store_uid = ? AND last_seen_generation != ?
                 )
                 """,
-                (store_uid, generation),
+                (store_uid, store_uid, generation),
             )
             deleted_count = connection.execute(
                 """
@@ -778,6 +824,7 @@ def _apply_metadata_scan(
                         message.nid,
                     ),
                 )
+                _index_message(connection, store_uid, message.nid)
                 continue
             else:
                 connection.execute(
@@ -956,7 +1003,30 @@ def _create_schema(connection: sqlite3.Connection) -> None:
                 REFERENCES recovered_message(store_uid, fingerprint) ON DELETE CASCADE
         );
 
-        CREATE VIRTUAL TABLE message_fts USING fts5(
+        CREATE TABLE search_document (
+            store_uid TEXT NOT NULL REFERENCES store(uid),
+            selector TEXT NOT NULL,
+            native_nid INTEGER,
+            recovered_fingerprint TEXT,
+            canonical_source_nid INTEGER NOT NULL,
+            folder_nid INTEGER NOT NULL,
+            folder_path TEXT NOT NULL,
+            date TEXT,
+            sender TEXT,
+            sender_aliases TEXT NOT NULL,
+            recipients_json TEXT NOT NULL,
+            recipients_text TEXT NOT NULL,
+            subject TEXT,
+            has_attachment INTEGER NOT NULL,
+            body TEXT,
+            PRIMARY KEY (store_uid, selector),
+            CHECK (
+                (native_nid IS NOT NULL AND recovered_fingerprint IS NULL)
+                OR (native_nid IS NULL AND recovered_fingerprint IS NOT NULL)
+            )
+        );
+
+        CREATE VIRTUAL TABLE search_fts USING fts5(
             subject,
             sender,
             recipients,
@@ -1371,44 +1441,39 @@ def _thread_order(row: Sequence[object]) -> tuple[int, datetime, int]:
     return (1, datetime.max, cast(int, row[0]))
 
 
-def _recovered_records(
+def _recovered_message_record(
+    store_uid: str, fingerprint: str, row: Sequence[object]
+) -> dict[str, object]:
+    """Render a recovered record through the ordinary persisted-message schema."""
+    return {
+        "attachment_count": 0,
+        "body": _sqlite_optional_text(row[4]),
+        "body_format": "plain",
+        "client_submit_time": _sqlite_optional_text(row[3]),
+        "conversation_index": None,
+        "conversation_topic": None,
+        "date": _sqlite_optional_text(row[3]),
+        "delivery_time": None,
+        "folder": _sqlite_optional_text(row[6]),
+        "folder_id": _record_id(store_uid, cast(int, row[5])),
+        "from": _sqlite_optional_text(row[0]),
+        "id": _recovered_record_id(store_uid, fingerprint),
+        "in_reply_to": None,
+        "internet_message_id": None,
+        "modification_time": None,
+        "references": None,
+        "subject": _sqlite_optional_text(row[2]),
+        "to": json.loads(_sqlite_optional_text(row[1]) or "[]"),
+        "transport_headers": None,
+    }
+
+
+def _recovered_message_records(
     store_uid: str, rows: Sequence[Sequence[object]]
 ) -> list[dict[str, object]]:
-    records: dict[str, dict[str, object]] = {}
-    for row in rows:
-        fingerprint = _sqlite_optional_text(row[0])
-        assert fingerprint is not None
-        record = records.setdefault(
-            fingerprint,
-            {
-                "attachment_count": 0,
-                "body": _sqlite_optional_text(row[7]),
-                "body_format": "quoted",
-                "client_submit_time": _sqlite_optional_text(row[5]),
-                "conversation_index": None,
-                "conversation_topic": None,
-                "date": _sqlite_optional_text(row[5]),
-                "date_raw": _sqlite_optional_text(row[6]),
-                "delivery_time": None,
-                "folder": None,
-                "folder_id": None,
-                "from": _sqlite_optional_text(row[1]),
-                "id": f"{store_uid}:q:{fingerprint}",
-                "in_reply_to": None,
-                "internet_message_id": None,
-                "modification_time": None,
-                "provenance": {"source_message_ids": []},
-                "record_type": "recovered",
-                "references": None,
-                "relation": _sqlite_optional_text(row[8]),
-                "subject": _sqlite_optional_text(row[4]),
-                "to": json.loads(_sqlite_optional_text(row[3]) or "[]"),
-                "transport_headers": None,
-            },
-        )
-        sources = cast(dict[str, list[str]], record["provenance"])["source_message_ids"]
-        sources.append(_record_id(store_uid, cast(int, row[9])))
-    return list(records.values())
+    return [
+        _recovered_message_record(store_uid, cast(str, row[0]), row[1:]) for row in rows
+    ]
 
 
 def _record_order(record: dict[str, object]) -> tuple[int, datetime, str]:
@@ -1494,7 +1559,10 @@ def _replace_attachments(
 def _index_message(connection: sqlite3.Connection, store_uid: str, nid: int) -> None:
     row = connection.execute(
         """
-        SELECT message.rowid, message.subject, message.sender_name, message.body_clean,
+        SELECT message.subject, message.sender_name,
+               COALESCE(message.delivery_time, message.client_submit_time),
+               message.attachment_count, message.body_clean, message.transport_headers,
+               folder.nid, folder.path,
                group_concat(
                    TRIM(
                        COALESCE(recipient.name || ' ', '')
@@ -1505,27 +1573,139 @@ def _index_message(connection: sqlite3.Connection, store_uid: str, nid: int) -> 
         FROM message
         LEFT JOIN recipient ON recipient.store_uid = message.store_uid
                            AND recipient.message_nid = message.nid
+        JOIN folder ON folder.store_uid = message.store_uid
+                   AND folder.nid = message.folder_nid
         WHERE message.store_uid = ? AND message.nid = ?
-        GROUP BY message.rowid
+        GROUP BY message.store_uid, message.nid
         """,
         (store_uid, nid),
     ).fetchone()
     if row is None:
         return
-    connection.execute("DELETE FROM message_fts WHERE rowid = ?", (row[0],))
+    recipients = _recipients_for_messages(connection, store_uid, ((nid,),))[nid]
+    sender = _sqlite_optional_text(row[1])
+    sender_email = _header_sender_email(_sqlite_optional_text(row[5]))
+    _upsert_search_document(
+        connection,
+        store_uid,
+        _record_id(store_uid, nid),
+        native_nid=nid,
+        recovered_fingerprint=None,
+        canonical_source_nid=nid,
+        folder_nid=cast(int, row[6]),
+        folder_path=cast(str, row[7]),
+        date=_sqlite_optional_text(row[2]),
+        sender=sender,
+        sender_aliases=" ".join(value for value in (sender, sender_email) if value),
+        recipients=recipients,
+        subject=_sqlite_optional_text(row[0]),
+        has_attachment=bool(row[3]),
+        body=_sqlite_optional_text(row[4]),
+    )
+
+
+def _upsert_search_document(
+    connection: sqlite3.Connection,
+    store_uid: str,
+    selector: str,
+    *,
+    native_nid: int | None,
+    recovered_fingerprint: str | None,
+    canonical_source_nid: int,
+    folder_nid: int,
+    folder_path: str,
+    date: str | None,
+    sender: str | None,
+    sender_aliases: str,
+    recipients: Sequence[str],
+    subject: str | None,
+    has_attachment: bool,
+    body: str | None,
+) -> None:
+    """Replace one normalized search document and its corresponding FTS row."""
+    existing = connection.execute(
+        "SELECT rowid FROM search_document WHERE store_uid = ? AND selector = ?",
+        (store_uid, selector),
+    ).fetchone()
+    if existing is not None:
+        connection.execute("DELETE FROM search_fts WHERE rowid = ?", (existing[0],))
+    recipients_json = json.dumps(recipients)
+    recipients_text = " ".join(recipients)
     connection.execute(
         """
-        INSERT INTO message_fts (rowid, subject, sender, recipients, body)
+        INSERT INTO search_document (
+            store_uid, selector, native_nid, recovered_fingerprint,
+            canonical_source_nid, folder_nid, folder_path, date, sender,
+            sender_aliases, recipients_json, recipients_text, subject,
+            has_attachment, body
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(store_uid, selector) DO UPDATE SET
+            native_nid = excluded.native_nid,
+            recovered_fingerprint = excluded.recovered_fingerprint,
+            canonical_source_nid = excluded.canonical_source_nid,
+            folder_nid = excluded.folder_nid,
+            folder_path = excluded.folder_path,
+            date = excluded.date,
+            sender = excluded.sender,
+            sender_aliases = excluded.sender_aliases,
+            recipients_json = excluded.recipients_json,
+            recipients_text = excluded.recipients_text,
+            subject = excluded.subject,
+            has_attachment = excluded.has_attachment,
+            body = excluded.body
+        """,
+        (
+            store_uid,
+            selector,
+            native_nid,
+            recovered_fingerprint,
+            canonical_source_nid,
+            folder_nid,
+            folder_path,
+            date,
+            sender,
+            sender_aliases,
+            recipients_json,
+            recipients_text,
+            subject,
+            has_attachment,
+            body,
+        ),
+    )
+    rowid = connection.execute(
+        "SELECT rowid FROM search_document WHERE store_uid = ? AND selector = ?",
+        (store_uid, selector),
+    ).fetchone()[0]
+    connection.execute(
+        """
+        INSERT INTO search_fts (rowid, subject, sender, recipients, body)
         VALUES (?, ?, ?, ?, ?)
         """,
-        row,
+        (rowid, subject, sender, recipients_text, body),
     )
+
+
+def _delete_search_documents(
+    connection: sqlite3.Connection, where: str, parameters: Sequence[object]
+) -> None:
+    """Remove projection and FTS rows selected by an internal SQL predicate."""
+    connection.execute(
+        "DELETE FROM search_fts WHERE rowid IN "
+        f"(SELECT rowid FROM search_document WHERE {where})",
+        parameters,
+    )
+    connection.execute(f"DELETE FROM search_document WHERE {where}", parameters)
 
 
 def _rebuild_recovered_messages(
     connection: sqlite3.Connection, store_uid: str, history: HistorySettings
 ) -> None:
     """Recreate derived quote records from native bodies in this transaction."""
+    _delete_search_documents(
+        connection,
+        "store_uid = ? AND recovered_fingerprint IS NOT NULL",
+        (store_uid,),
+    )
     connection.execute("DELETE FROM quote_occurrence WHERE store_uid = ?", (store_uid,))
     connection.execute(
         "DELETE FROM recovered_message WHERE store_uid = ?", (store_uid,)
@@ -1593,6 +1773,57 @@ def _rebuild_recovered_messages(
         """,
         occurrences,
     )
+    _index_recovered_messages(connection, store_uid)
+
+
+def _index_recovered_messages(connection: sqlite3.Connection, store_uid: str) -> None:
+    """Materialize each recovered record using its canonical quote occurrence."""
+    rows = connection.execute(
+        """
+        SELECT recovered_message.fingerprint, recovered_message.sender,
+               recovered_message.sender_email, recovered_message.recipients_json,
+               recovered_message.subject, recovered_message.sent_at,
+               recovered_message.body, quote_occurrence.source_message_nid,
+               quote_occurrence.quote_index, folder.nid, folder.path
+        FROM recovered_message
+        JOIN quote_occurrence
+          ON quote_occurrence.store_uid = recovered_message.store_uid
+         AND quote_occurrence.recovered_fingerprint = recovered_message.fingerprint
+        JOIN message ON message.store_uid = quote_occurrence.store_uid
+                    AND message.nid = quote_occurrence.source_message_nid
+        JOIN folder ON folder.store_uid = message.store_uid
+                   AND folder.nid = message.folder_nid
+        WHERE recovered_message.store_uid = ?
+        ORDER BY recovered_message.fingerprint, quote_occurrence.source_message_nid,
+                 quote_occurrence.quote_index
+        """,
+        (store_uid,),
+    ).fetchall()
+    fingerprints: set[str] = set()
+    for row in rows:
+        fingerprint = cast(str, row[0])
+        if fingerprint in fingerprints:
+            continue
+        fingerprints.add(fingerprint)
+        sender = _sqlite_optional_text(row[1])
+        sender_email = _sqlite_optional_text(row[2])
+        _upsert_search_document(
+            connection,
+            store_uid,
+            _recovered_record_id(store_uid, fingerprint),
+            native_nid=None,
+            recovered_fingerprint=fingerprint,
+            canonical_source_nid=cast(int, row[7]),
+            folder_nid=cast(int, row[9]),
+            folder_path=cast(str, row[10]),
+            date=_sqlite_optional_text(row[5]),
+            sender=sender,
+            sender_aliases=" ".join(value for value in (sender, sender_email) if value),
+            recipients=tuple(json.loads(_sqlite_optional_text(row[3]) or "[]")),
+            subject=_sqlite_optional_text(row[4]),
+            has_attachment=False,
+            body=_sqlite_optional_text(row[6]),
+        )
 
 
 def _header_sender_email(headers: str | None) -> str | None:
@@ -1656,6 +1887,15 @@ def _require_index_state(database_path: str | Path) -> _IndexState:
 
 def _record_id(store_uid: str, nid: int) -> str:
     return f"{store_uid}:{nid}"
+
+
+def _recovered_record_id(store_uid: str, fingerprint: str) -> str:
+    return f"{store_uid}:q:{fingerprint}"
+
+
+def _parse_recovered_record_id(value: str) -> tuple[str, str] | None:
+    store_uid, separator, fingerprint = value.partition(":q:")
+    return (store_uid, fingerprint) if separator and store_uid and fingerprint else None
 
 
 def _attachment_id(store_uid: str, message_nid: int, attachment_index: int) -> str:

@@ -114,17 +114,17 @@ def main(ctx: click.Context, config: str | None, get_config_template: Any) -> No
     Configuration:
       Set archive.pst_path and archive.index_path in --config FILE, or set
       PSTQ_ARCHIVE__PST_PATH and PSTQ_ARCHIVE__INDEX_PATH. Optional history
-      owner aliases and timezone control quoted-owner recovery in thread. Exactly
-      one PST and
+      owner aliases and timezone provide context for quoted owner history.
+      Exactly one PST and
       one SQLite cache are configured per invocation. The index directory must
       already exist: synchronization creates a sibling temporary database and
       atomically replaces the cache only after a successful source check.
 
     Agent contract:
       Use --json for deterministic, pretty-printed JSON with sorted keys.
-      Stable message and folder IDs are STORE_UID:NID; attachment IDs are
-      STORE_UID:MESSAGE_NID:INDEX. Read each command's --help for its complete
-      request, result schema, limits, and source/cache access behavior.
+      Message IDs are stable selectors; folder IDs are STORE_UID:NID; attachment
+      IDs are STORE_UID:MESSAGE_NID:INDEX. Read each command's --help for its
+      complete request, result schema, limits, and source/cache access behavior.
       Runtime failures in JSON mode are written to stderr as
       {"error":{"code":"...","message":"..."}}. Exit 0 means success,
       1 means an operational/configuration failure, and 2 means invalid CLI
@@ -310,6 +310,11 @@ def folders(ctx: click.Context, json_output: bool) -> None:
 @main.command()
 @click.argument("query")
 @click.option("--from", "sender", help="Match the sender name.")
+@click.option(
+    "--from-owner",
+    is_flag=True,
+    help="Match any configured history.owner_emails or history.owner_names alias.",
+)
 @click.option("--to", "recipient", help="Match persisted recipient name or email.")
 @click.option("--after", help="Include messages on or after this ISO-8601 timestamp.")
 @click.option("--before", help="Include messages before this ISO-8601 timestamp.")
@@ -328,6 +333,7 @@ def search(
     ctx: click.Context,
     query: str,
     sender: str | None,
+    from_owner: bool,
     recipient: str | None,
     after: str | None,
     before: str | None,
@@ -339,20 +345,34 @@ def search(
     """Synchronize when needed, then run a bounded FTS5 search.
 
     QUERY uses SQLite FTS5 syntax and must not be empty. --from and --to match
-    sender and persisted recipient text; --after is inclusive and --before is
-    exclusive ISO-8601 timestamp filtering; --folder is an exact cached path;
-    --has-attachment requires attachment_count > 0. --limit defaults to 20 and
-    accepts 1 through 100. search compares source path, size, and mtime before
-    querying, then atomically synchronizes if the cache is stale.
+    sender and persisted recipient text. --from-owner matches any configured
+    owner alias and cannot be combined with --from. --after is inclusive and
+    --before is exclusive ISO-8601 timestamp filtering; --folder is an exact
+    cached path; --has-attachment requires attachment_count > 0. --limit
+    defaults to 20 and accepts 1 through 100. search compares source path, size,
+    and mtime before querying, then atomically synchronizes if the cache is stale.
 
     --json returns at most limit lightweight records, ordered by FTS score then
-    message NID: [{date, folder, from, id, score, snippet, subject, to}]. id is
-    the stable STORE_UID:NID selector for show, thread, and attachments. Bodies
-    are intentionally omitted; call show only for relevant candidates.
+    stable message ID: [{date, folder, from, id, score, snippet, subject, to}].
+    id is a stable selector for show, thread, and attachments. Bodies are
+    intentionally omitted; call show only for relevant candidates.
     """
     source_path, database_path = _configured_paths(ctx)
     try:
         history = _history_settings(ctx)
+        if from_owner and sender:
+            raise CliContractError(
+                "--from-owner cannot be combined with --from.", "invalid_request"
+            )
+        sender_aliases = (
+            history.owner_emails + history.owner_names if from_owner else ()
+        )
+        if from_owner and not sender_aliases:
+            raise CliContractError(
+                "--from-owner requires configured history.owner_emails or "
+                "history.owner_names.",
+                "configuration_error",
+            )
         if history == DEFAULT_HISTORY_SETTINGS:
             sync_pst(source_path, database_path)
         else:
@@ -361,6 +381,7 @@ def search(
             database_path,
             query,
             sender=sender,
+            sender_aliases=sender_aliases,
             recipient=recipient,
             after=after,
             before=before,
@@ -395,16 +416,17 @@ def show(
 ) -> None:
     """Display one persisted message from SQLite; use --full for raw body.
 
-    MESSAGE_ID must be the STORE_UID:NID returned by search. The default body is
+    MESSAGE_ID must be a stable selector returned by search. The default body is
     conservatively cleaned of recognizable quoted history; --full selects the
-    preserved raw body in both text and JSON output. This command does not open
-    or synchronize the PST.
+    preserved raw body where available in both text and JSON output. This command
+    does not open or synchronize the PST.
 
     --json returns {attachment_count, body, body_format, client_submit_time,
     conversation_index, conversation_topic, date, delivery_time, folder,
     folder_id, from, id, in_reply_to, internet_message_id, modification_time,
     references, subject, to, transport_headers}. Values may be null when the
-    PST did not expose that property. id and folder_id are stable STORE_UID:NID.
+    PST did not expose that property. id is a stable selector; folder_id is a
+    stable STORE_UID:NID value.
     """
     _, database_path = _configured_paths(ctx)
     try:
@@ -433,16 +455,15 @@ def show(
 @click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
 @click.pass_context
 def thread(ctx: click.Context, message_id: str, json_output: bool) -> None:
-    """Display related cached and recovered messages as separate contributions.
+    """Display related cached messages as separate contributions.
 
-    MESSAGE_ID is a STORE_UID:NID. --json returns {id, messages}, where id is
-    the requested selector and messages is a chronological array of the same
-    message schema returned by show (with the cleaned body). Configured
-    owner-history recovery may add records with record_type "recovered",
-    provenance, and relation. Relationships use persisted Internet headers and
-    Outlook conversation metadata; absent or inconsistent metadata can leave a
-    thread incomplete. This command reads SQLite only and does not open or
-    synchronize the PST.
+    MESSAGE_ID is a stable selector returned by search. --json returns
+    {id, messages}, where id is the requested selector and messages is a
+    chronological array of the same message schema returned by show (with the
+    cleaned body). Relationships use persisted Internet headers and Outlook
+    conversation metadata; absent or inconsistent metadata can leave a thread
+    incomplete. This command reads SQLite only and does not open or synchronize
+    the PST.
     """
     _, database_path = _configured_paths(ctx)
     try:
@@ -477,9 +498,9 @@ def thread(ctx: click.Context, message_id: str, json_output: bool) -> None:
 def attachments(ctx: click.Context, message_id: str, json_output: bool) -> None:
     """List persisted attachment metadata from SQLite without opening the PST.
 
-    MESSAGE_ID is a STORE_UID:NID. --json returns an index-ordered array of
-    {attachment_method, content_id, content_location, filename, hidden, id,
-    mime_type, rendering_position, size}. id is the stable
+    MESSAGE_ID is a stable selector returned by search. --json returns an
+    index-ordered array of {attachment_method, content_id, content_location,
+    filename, hidden, id, mime_type, rendering_position, size}. id is the stable
     STORE_UID:MESSAGE_NID:INDEX selector for attachment. Metadata fields may be
     null when unavailable. This command reads SQLite only and does not refresh.
     """

@@ -72,7 +72,7 @@ They deliberately omit message bodies.
 ```console
 $ pstq --config pstq.yaml search 'Capon calibration' --json
 $ pstq --config pstq.yaml search invoice \
-    --from 'Jane Doe' \
+    --from-owner \
     --to accounting@example.com \
     --after 2025-01-01 \
     --before 2026-01-01 \
@@ -85,11 +85,9 @@ $ pstq --config pstq.yaml search invoice \
 Search supports FTS5 query syntax. Quote punctuation-heavy or exact phrases,
 and prefer the `--to` filter for recipient email addresses.
 
-Each result has a stable `id` composed of the store UID and PST NID, for
-example `edc4f1c4c743ad49a590c83842fd889f:2128196`. Search JSON includes
-`id`, `date`, `from`, `to`, `subject`, `folder`, `snippet`, and `score`.
-Pass the selected ID to `show` to retrieve the persisted message with cleaned
-body content by default:
+Each result has a stable `id`. Search JSON includes `id`, `date`, `from`, `to`,
+`subject`, `folder`, `snippet`, and `score`. Pass the selected ID to `show` to
+retrieve the persisted message with cleaned body content by default:
 
 ```console
 $ pstq --config pstq.yaml show edc4f1c4c743ad49a590c83842fd889f:2128196 --json
@@ -105,11 +103,9 @@ message headers, relationship metadata, and attachment count.
 If the manually curated PST omits Sent Items, configure `history.owner_emails`
 and, where needed, exact display-name `history.owner_names` aliases. During
 synchronization PSTQ conservatively recovers complete Outlook reply and
-forwarded-message blocks in English, Czech, German, and Japanese. `thread`
-then includes high-confidence owner contributions as `record_type: "recovered"`
-records. They include a deterministic `STORE_UID:q:HASH` ID, a relation of
-`reply_history` or `forwarded_context`, and source-message provenance. Recovered
-content is not independently searchable in this release. Ambiguous, edited, or
+forwarded-message blocks in English, Czech, German, and Japanese. Those
+messages participate in normal search, show, and thread results. Use
+`--from-owner` to match any configured owner alias. Ambiguous, edited, or
 incomplete quotation blocks are intentionally omitted. `history.timezone` must
 be an IANA timezone and is applied to quoted timestamps that omit an offset.
 
@@ -121,15 +117,15 @@ be an IANA timezone and is applied to quoted timestamps that omit an offset.
 | `folders [--json]` | List indexed folder paths and stable IDs. |
 | `search QUERY [filters] [--json]` | Synchronize when needed, then run a bounded FTS5 search. |
 | `show MESSAGE_ID [--full] [--json]` | Retrieve one persisted message from SQLite; cleaned body by default. |
-| `thread MESSAGE_ID [--json]` | Reconstruct a related-message view and configured owner history from persisted cache data. |
+| `thread MESSAGE_ID [--json]` | Reconstruct a related-message view from persisted cache data. |
 | `attachments MESSAGE_ID [--json]` | List persisted attachment metadata from SQLite. |
 | `attachment ATTACHMENT_ID --output FILE` | Synchronize if needed, then extract one original attachment through its cached PST locator. |
 
 `search` filters are `--from`, `--to`, `--after`, `--before`, `--folder`,
-`--has-attachment`, and `--limit`. The full agent contract, including JSON
-schemas, stable ID formats, error envelopes, cache access, limits, and known
-libpff limitations, is maintained in the CLI itself. Read it before invoking a
-command:
+`--has-attachment`, `--from-owner`, and `--limit`. The full agent contract,
+including JSON schemas, stable ID formats, error envelopes, cache access,
+limits, and known libpff limitations, is maintained in the CLI itself. Read it
+before invoking a command:
 
 ```console
 $ pstq --help

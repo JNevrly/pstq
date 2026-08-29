@@ -347,6 +347,52 @@ def test_search_passes_owner_history_settings_to_synchronization(
     ]
 
 
+def test_search_from_owner_expands_aliases_and_validates_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "archive:\n  pst_path: archive.pst\n  index_path: index.sqlite\n"
+        "history:\n  owner_emails:\n    - owner@example.test\n"
+        "  owner_names:\n    - Owner\n  timezone: UTC\n"
+    )
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(cli, "sync_pst", lambda *_: None)
+    monkeypatch.setattr(
+        cli,
+        "search_messages",
+        lambda *_args, **kwargs: calls.append(kwargs) or [],
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli.main, ["--config", str(config_path), "search", "x", "--from-owner"]
+    )
+    conflict = runner.invoke(
+        cli.main,
+        [
+            "--config",
+            str(config_path),
+            "search",
+            "x",
+            "--from",
+            "Owner",
+            "--from-owner",
+        ],
+    )
+    missing = runner.invoke(
+        cli.main,
+        ["--config", str(_archive_config(tmp_path)), "search", "x", "--from-owner"],
+    )
+
+    assert result.exit_code == 0
+    assert calls[0]["sender_aliases"] == ("owner@example.test", "Owner")
+    assert conflict.exit_code == 1
+    assert "cannot be combined" in conflict.output
+    assert missing.exit_code == 1
+    assert "requires configured" in missing.output
+
+
 def test_show_command_reads_only_the_persisted_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
