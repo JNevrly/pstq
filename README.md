@@ -13,9 +13,29 @@ libpff binding is required to create or synchronize the cache.
 
 ## Installation
 
+`pypff`, the Python binding for libpff, is required to read PST archives. It is
+a native extension and upstream does not provide a Linux wheel for Python 3.13,
+so `pip install pstq` alone cannot create or synchronize a cache.
+
+The supported installation is the included devcontainer. It builds the pinned,
+checksum-verified libpff-python source release for Python 3.13, then installs
+the project dependencies:
+
 ```console
-$ pip install pstq
+$ git clone https://github.com/JNevrly/pstq.git
+$ cd pstq
 ```
+
+Open the clone in VS Code and choose **Dev Containers: Reopen in Container**.
+After the container is ready, verify the installation with:
+
+```console
+$ uv run pstq --help
+```
+
+For a manual installation, first build and install a compatible `pypff` wheel
+for the target Python and platform, then install `pstq`. The devcontainer
+[`Dockerfile`](.devcontainer/Dockerfile) is the reference build recipe.
 
 ## Configuration
 
