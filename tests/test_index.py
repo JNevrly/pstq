@@ -202,6 +202,40 @@ def test_import_pst_creates_normalized_cache(tmp_path: Path) -> None:
     assert state[0][5]
 
 
+def test_import_pst_indexes_thread_relationship_metadata(tmp_path: Path) -> None:
+    database_path = tmp_path / "index.sqlite"
+
+    index.import_pst("archive.pst", database_path)
+
+    assert _rows(
+        database_path,
+        """
+        SELECT message_nid, identifier, relation_type
+        FROM message_relation
+        ORDER BY identifier, relation_type
+        """,
+    ) == [
+        (3, "<message@example.test>", 1),
+        (3, "<parent@example.test>", 0),
+        (3, "<root@example.test>", 0),
+    ]
+    assert _rows(
+        database_path,
+        "SELECT conversation_topic_key, conversation_root FROM message",
+    ) == [("status", None)]
+    message_indexes = {
+        row[1] for row in _rows(database_path, "PRAGMA index_list('message')")
+    }
+    relation_indexes = {
+        row[1] for row in _rows(database_path, "PRAGMA index_list('message_relation')")
+    }
+    assert {
+        "message_conversation_root",
+        "message_conversation_topic_key",
+    } <= message_indexes
+    assert "message_relation_identifier" in relation_indexes
+
+
 def test_import_pst_prefers_mapi_relationship_values_and_falls_back_to_headers(
     tmp_path: Path,
 ) -> None:
@@ -319,6 +353,61 @@ def test_get_thread_follows_transitive_header_relations_and_keeps_bodies_separat
         "Parent contribution",
         "Reply contribution",
     ]
+
+
+def test_get_thread_queries_the_indexed_relationship_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "index.sqlite"
+    FakeReader.folders = _records(
+        _thread_message(
+            10,
+            headers="Message-ID: <root@example.test>",
+            body="Root",
+            delivery_time=datetime(2026, 8, 20, 10),
+        ),
+        _thread_message(
+            11,
+            headers=(
+                "Message-ID: <reply@example.test>\n"
+                "In-Reply-To: <root@example.test>"
+            ),
+            body="Reply",
+            delivery_time=datetime(2026, 8, 20, 11),
+        ),
+        *(
+            _thread_message(
+                nid,
+                headers=f"Message-ID: <unrelated-{nid}@example.test>",
+                body="Unrelated",
+                delivery_time=datetime(2026, 8, 20, 12),
+            )
+            for nid in range(12, 112)
+        ),
+    )
+    index.import_pst("archive.pst", database_path)
+    statements: list[str] = []
+    original_connect = sqlite3.connect
+
+    def traced_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        connection = original_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(index.sqlite3, "connect", traced_connect)
+
+    result = index.get_thread(database_path, "store:11")
+
+    assert [message["id"] for message in result["messages"]] == [
+        "store:10",
+        "store:11",
+    ]
+    assert any("FROM member" in statement for statement in statements)
+    assert any("message_relation AS current" in statement for statement in statements)
+    assert not any(
+        "internet_message_id, in_reply_to, references_header" in statement
+        for statement in statements
+    )
 
 
 def test_get_thread_uses_conversation_index_then_topic_as_conservative_fallbacks(

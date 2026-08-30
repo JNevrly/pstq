@@ -18,6 +18,12 @@ unrelated conversations.
 Persist the available relationship metadata in the disposable SQLite cache and
 reconstruct each requested thread from that cache without reopening the PST.
 
+Normalize each parsed Internet Message-ID and reference into an indexed
+`message_relation` cache table. Resolve the header-connected component with a
+recursive SQLite query over those identifiers, materializing only its member
+NIDs. Persist normalized conversation-index roots and conversation-topic keys
+on `message`, with indexes for each fallback lookup.
+
 Build a connected component from normalized Internet Message-ID,
 In-Reply-To, and References values first. If the component contains only the
 requested message, match messages with the same valid conversation-index root.
@@ -32,11 +38,10 @@ outside the archive or relationship data is missing. Topic metadata is a
 last-resort fallback and is never unioned with a stronger component, avoiding
 known over-grouping of generic subjects.
 
-The initial implementation loads lightweight relationship metadata and builds
-the component in Python. This keeps the cache schema simple, but scans the
-indexed store for each query. A future performance phase may add normalized
-relation tables and indexes without changing the command contract or fallback
-order.
+Thread lookup cost is proportional to the header-connected component or the
+selected fallback group, rather than every message in the store. The cache has
+additional derived relationship rows and indexes, and a schema-version change
+rebuilds disposable existing caches.
 
 ## References
 

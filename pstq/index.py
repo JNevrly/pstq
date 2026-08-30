@@ -29,7 +29,7 @@ from pstq.body import (
 )
 from pstq.pst import PstAttachment, PstFolder, PstMessage, PstReader
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 CLEANER_VERSION = 4
 
 _ORIGINAL_MESSAGE_SEPARATOR = re.compile(
@@ -469,18 +469,17 @@ def get_thread(database_path: str | Path, message_id: str) -> dict[str, object]:
             if anchor is None:
                 raise ValueError(f"Message not found: {message_id}")
             anchor_nid = cast(int, anchor[0])
-        relationship_rows = connection.execute(
+        anchor_metadata = connection.execute(
             """
-            SELECT nid, internet_message_id, in_reply_to, references_header,
-                   conversation_topic, conversation_index
+            SELECT conversation_topic, conversation_index
             FROM message
-            WHERE store_uid = ?
+            WHERE store_uid = ? AND nid = ?
             """,
-            (store_uid,),
-        ).fetchall()
-        if not any(row[0] == anchor_nid for row in relationship_rows):
+            (store_uid, anchor_nid),
+        ).fetchone()
+        if anchor_metadata is None:
             raise ValueError(f"Message not found: {message_id}")
-        nids = _thread_members(relationship_rows, anchor_nid)
+        nids = _thread_members(connection, store_uid, anchor_nid, anchor_metadata)
         placeholders = ", ".join("?" for _ in nids)
         rows = connection.execute(
             f"""
@@ -939,6 +938,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             references_header TEXT,
             conversation_topic TEXT,
             conversation_index TEXT,
+            conversation_topic_key TEXT,
+            conversation_root TEXT,
             attachment_count INTEGER NOT NULL,
             body_raw TEXT,
             body_clean TEXT,
@@ -948,6 +949,24 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             PRIMARY KEY (store_uid, nid),
             FOREIGN KEY (store_uid, folder_nid) REFERENCES folder(store_uid, nid)
         );
+
+        CREATE INDEX message_conversation_topic_key
+            ON message (store_uid, conversation_topic_key);
+        CREATE INDEX message_conversation_root
+            ON message (store_uid, conversation_root);
+
+        CREATE TABLE message_relation (
+            store_uid TEXT NOT NULL,
+            message_nid INTEGER NOT NULL,
+            identifier TEXT NOT NULL,
+            relation_type INTEGER NOT NULL CHECK (relation_type IN (0, 1)),
+            PRIMARY KEY (store_uid, message_nid, identifier, relation_type),
+            FOREIGN KEY (store_uid, message_nid)
+                REFERENCES message(store_uid, nid) ON DELETE CASCADE
+        );
+
+        CREATE INDEX message_relation_identifier
+            ON message_relation (store_uid, identifier);
 
         CREATE TABLE recipient (
             store_uid TEXT NOT NULL,
@@ -1076,15 +1095,26 @@ def _upsert_message(
 ) -> None:
     body_raw, body_format = _select_body(message)
     relationships = _relationships(message.transport_headers)
+    internet_message_id = (
+        message.internet_message_id or relationships["internet_message_id"]
+    )
+    in_reply_to = message.in_reply_to or relationships["in_reply_to"]
+    references_header = message.references_header or relationships["references_header"]
+    conversation_topic = (
+        message.conversation_topic or relationships["conversation_topic"]
+    )
+    conversation_index = (
+        message.conversation_index or relationships["conversation_index"]
+    )
     connection.execute(
         """
         INSERT INTO message (
             store_uid, nid, folder_nid, modification_time, subject, sender_name,
             client_submit_time, delivery_time, transport_headers, internet_message_id,
             in_reply_to, references_header, conversation_topic, conversation_index,
-            attachment_count, body_raw, body_clean, body_format, index_in_folder,
-            last_seen_generation
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            conversation_topic_key, conversation_root, attachment_count, body_raw,
+            body_clean, body_format, index_in_folder, last_seen_generation
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(store_uid, nid) DO UPDATE SET
             folder_nid = excluded.folder_nid,
             modification_time = excluded.modification_time,
@@ -1098,6 +1128,8 @@ def _upsert_message(
             references_header = excluded.references_header,
             conversation_topic = excluded.conversation_topic,
             conversation_index = excluded.conversation_index,
+            conversation_topic_key = excluded.conversation_topic_key,
+            conversation_root = excluded.conversation_root,
             attachment_count = excluded.attachment_count,
             body_raw = excluded.body_raw,
             body_clean = excluded.body_clean,
@@ -1115,11 +1147,13 @@ def _upsert_message(
             _format_time(message.client_submit_time),
             _format_time(message.delivery_time),
             message.transport_headers,
-            message.internet_message_id or relationships["internet_message_id"],
-            message.in_reply_to or relationships["in_reply_to"],
-            message.references_header or relationships["references_header"],
-            message.conversation_topic or relationships["conversation_topic"],
-            message.conversation_index or relationships["conversation_index"],
+            internet_message_id,
+            in_reply_to,
+            references_header,
+            conversation_topic,
+            conversation_index,
+            _conversation_topic(conversation_topic),
+            _conversation_root(conversation_index),
             message.attachment_count,
             body_raw,
             clean_body(
@@ -1140,9 +1174,47 @@ def _upsert_message(
             generation,
         ),
     )
+    _replace_message_relations(
+        connection,
+        store_uid,
+        message.nid,
+        internet_message_id,
+        in_reply_to,
+        references_header,
+    )
     _replace_recipients(connection, store_uid, message.nid, message.transport_headers)
     _replace_attachments(connection, store_uid, message.nid, message.attachments)
     _index_message(connection, store_uid, message.nid)
+
+
+def _replace_message_relations(
+    connection: sqlite3.Connection,
+    store_uid: str,
+    message_nid: int,
+    internet_message_id: str | None,
+    in_reply_to: str | None,
+    references_header: str | None,
+) -> None:
+    connection.execute(
+        "DELETE FROM message_relation WHERE store_uid = ? AND message_nid = ?",
+        (store_uid, message_nid),
+    )
+    relations = [
+        (store_uid, message_nid, identifier, 1)
+        for identifier in _message_ids(internet_message_id)
+    ]
+    relations.extend(
+        (store_uid, message_nid, identifier, 0)
+        for identifier in _message_ids(in_reply_to) | _message_ids(references_header)
+    )
+    connection.executemany(
+        """
+        INSERT OR IGNORE INTO message_relation (
+            store_uid, message_nid, identifier, relation_type
+        ) VALUES (?, ?, ?, ?)
+        """,
+        relations,
+    )
 
 
 def _source_state(source_path: str | Path) -> _SourceState:
@@ -1355,69 +1427,82 @@ def _thread_index(value: str | None) -> str | None:
 
 
 def _thread_members(
-    rows: Sequence[Sequence[object]], anchor_nid: int
+    connection: sqlite3.Connection,
+    store_uid: str,
+    anchor_nid: int,
+    anchor_metadata: Sequence[object],
 ) -> tuple[int, ...]:
     """Choose the strongest available indexed relationship component."""
-    metadata = {cast(int, row[0]): row for row in rows}
-    message_ids: dict[str, set[int]] = {}
-    for nid, row in metadata.items():
-        for value in _message_ids(_sqlite_optional_text(row[1])):
-            message_ids.setdefault(value, set()).add(nid)
-
-    neighbors: dict[int, set[int]] = {nid: set() for nid in metadata}
-    for matching_nids in message_ids.values():
-        for nid in matching_nids:
-            neighbors[nid].update(matching_nids - {nid})
-    for nid, row in metadata.items():
-        references = _message_ids(_sqlite_optional_text(row[2]))
-        references.update(_message_ids(_sqlite_optional_text(row[3])))
-        for reference in references:
-            for target_nid in message_ids.get(reference, ()):
-                if target_nid != nid:
-                    neighbors[nid].add(target_nid)
-                    neighbors[target_nid].add(nid)
-
-    members = _connected_members(neighbors, anchor_nid)
-    if len(members) > 1:
-        return tuple(members)
-
-    conversation_root = _conversation_root(
-        _sqlite_optional_text(metadata[anchor_nid][5])
+    members = tuple(
+        row[0]
+        for row in connection.execute(
+            """
+            WITH RECURSIVE member(nid) AS (
+                VALUES (?)
+                UNION
+                SELECT related.message_nid
+                FROM member
+                JOIN message_relation AS current
+                  ON current.store_uid = ?
+                 AND current.message_nid = member.nid
+                 AND current.relation_type = 1
+                JOIN message_relation AS related
+                  ON related.store_uid = current.store_uid
+                 AND related.identifier = current.identifier
+                UNION
+                SELECT target.message_nid
+                FROM member
+                JOIN message_relation AS reference
+                  ON reference.store_uid = ?
+                 AND reference.message_nid = member.nid
+                 AND reference.relation_type = 0
+                JOIN message_relation AS target
+                  ON target.store_uid = reference.store_uid
+                 AND target.identifier = reference.identifier
+                 AND target.relation_type = 1
+            )
+            SELECT nid FROM member
+            """,
+            (anchor_nid, store_uid, store_uid),
+        )
     )
-    if conversation_root is not None:
-        members = {
-            nid
-            for nid, row in metadata.items()
-            if _conversation_root(_sqlite_optional_text(row[5])) == conversation_root
-        }
-        if len(members) > 1:
-            return tuple(members)
+    if len(members) > 1:
+        return members
 
-    topic = _conversation_topic(_sqlite_optional_text(metadata[anchor_nid][4]))
-    if topic is not None:
-        members = {
-            nid
-            for nid, row in metadata.items()
-            if _conversation_topic(_sqlite_optional_text(row[4])) == topic
-        }
+    conversation_root = _conversation_root(_sqlite_optional_text(anchor_metadata[1]))
+    if conversation_root is not None:
+        members = tuple(
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT nid FROM message
+                WHERE store_uid = ? AND conversation_root = ?
+                """,
+                (store_uid, conversation_root),
+            )
+        )
         if len(members) > 1:
-            return tuple(members)
+            return members
+
+    topic = _conversation_topic(_sqlite_optional_text(anchor_metadata[0]))
+    if topic is not None:
+        members = tuple(
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT nid FROM message
+                WHERE store_uid = ? AND conversation_topic_key = ?
+                """,
+                (store_uid, topic),
+            )
+        )
+        if len(members) > 1:
+            return members
     return (anchor_nid,)
 
 
 def _message_ids(value: str | None) -> set[str]:
     return {match.group().casefold() for match in _MESSAGE_ID.finditer(value or "")}
-
-
-def _connected_members(neighbors: dict[int, set[int]], anchor_nid: int) -> set[int]:
-    members = {anchor_nid}
-    pending = [anchor_nid]
-    while pending:
-        nid = pending.pop()
-        for neighbor in neighbors[nid] - members:
-            members.add(neighbor)
-            pending.append(neighbor)
-    return members
 
 
 def _conversation_root(value: str | None) -> str | None:
