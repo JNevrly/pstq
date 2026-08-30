@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from collections.abc import Sequence
 from importlib.resources import files
 from pathlib import Path
@@ -43,10 +42,21 @@ class CliContractError(click.ClickException):
     def __init__(self, message: str, code: str = "command_failed") -> None:
         super().__init__(message)
         self.code = code
+        self.ctx = click.get_current_context(silent=True)
 
 
 class CliContractGroup(click.Group):
     """Render every expected command failure in the selected output format."""
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        super().parse_args(ctx, args)
+        if (
+            ctx._protected_args
+            and self.get_command(ctx, ctx._protected_args[0]) is None
+        ):
+            ctx.args = [*ctx._protected_args, *ctx.args]
+            ctx._protected_args = []
+        return ctx.args
 
     def main(
         self,
@@ -56,7 +66,6 @@ class CliContractGroup(click.Group):
         standalone_mode: bool = True,
         **extra: Any,
     ) -> Any:
-        requested_args = sys.argv[1:] if args is None else args
         try:
             return super().main(
                 args=args,
@@ -66,7 +75,7 @@ class CliContractGroup(click.Group):
                 **extra,
             )
         except click.ClickException as error:
-            if _json_requested(requested_args):
+            if _json_requested(error):
                 click.echo(
                     _json(
                         {
@@ -156,6 +165,8 @@ def main(ctx: click.Context, config: str | None, get_config_template: Any) -> No
     except ConfigValidationError as error:
         raise CliContractError(str(error), "configuration_error") from error
     ctx.obj = config_manager.config
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
 
 
 @main.command()
@@ -163,7 +174,13 @@ def main(ctx: click.Context, config: str | None, get_config_template: Any) -> No
 @click.option(
     "--sample-size", type=click.IntRange(min=0), default=10, show_default=True
 )
-@click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    is_eager=True,
+    help="Print deterministic JSON.",
+)
 def inspect(path: str, sample_size: int, json_output: bool) -> None:
     """Report read-only metadata traversal performance for PATH.
 
@@ -204,7 +221,9 @@ def inspect(path: str, sample_size: int, json_output: bool) -> None:
 @main.command()
 @click.argument("path", type=click.Path(path_type=str))
 @click.argument("output", type=click.Path(path_type=str, dir_okay=False))
-@click.option("--json", "json_output", is_flag=True, help="Render errors as JSON.")
+@click.option(
+    "--json", "json_output", is_flag=True, is_eager=True, help="Render errors as JSON."
+)
 def snapshot(path: str, output: str, json_output: bool) -> None:
     """Write a body-free metadata snapshot for PATH to OUTPUT.
 
@@ -231,7 +250,13 @@ def snapshot(path: str, output: str, json_output: bool) -> None:
 @main.command("compare-snapshots")
 @click.argument("before", type=click.Path(exists=True, dir_okay=False, path_type=str))
 @click.argument("after", type=click.Path(exists=True, dir_okay=False, path_type=str))
-@click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    is_eager=True,
+    help="Print deterministic JSON.",
+)
 def compare_snapshots_command(before: str, after: str, json_output: bool) -> None:
     """Classify metadata changes between BEFORE and AFTER snapshots.
 
@@ -261,7 +286,13 @@ def compare_snapshots_command(before: str, after: str, json_output: bool) -> Non
 
 
 @main.command()
-@click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    is_eager=True,
+    help="Print deterministic JSON.",
+)
 @click.pass_context
 def status(ctx: click.Context, json_output: bool) -> None:
     """Report configured source and SQLite cache freshness without opening PST.
@@ -294,7 +325,13 @@ def status(ctx: click.Context, json_output: bool) -> None:
 
 
 @main.command()
-@click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    is_eager=True,
+    help="Print deterministic JSON.",
+)
 @click.pass_context
 def folders(ctx: click.Context, json_output: bool) -> None:
     """List folders from the existing cache with stable IDs and paths.
@@ -336,7 +373,13 @@ def folders(ctx: click.Context, json_output: bool) -> None:
     show_default=True,
     help="Maximum results.",
 )
-@click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    is_eager=True,
+    help="Print deterministic JSON.",
+)
 @click.pass_context
 def search(
     ctx: click.Context,
@@ -418,7 +461,13 @@ def search(
     is_flag=True,
     help="Show the original raw body instead of cleaned content.",
 )
-@click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    is_eager=True,
+    help="Print deterministic JSON.",
+)
 @click.pass_context
 def show(
     ctx: click.Context, message_id: str, full_body: bool, json_output: bool
@@ -461,7 +510,13 @@ def show(
 
 @main.command()
 @click.argument("message_id")
-@click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    is_eager=True,
+    help="Print deterministic JSON.",
+)
 @click.pass_context
 def thread(ctx: click.Context, message_id: str, json_output: bool) -> None:
     """Display related cached messages as separate contributions.
@@ -502,7 +557,13 @@ def thread(ctx: click.Context, message_id: str, json_output: bool) -> None:
 
 @main.command()
 @click.argument("message_id")
-@click.option("--json", "json_output", is_flag=True, help="Print deterministic JSON.")
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    is_eager=True,
+    help="Print deterministic JSON.",
+)
 @click.pass_context
 def attachments(ctx: click.Context, message_id: str, json_output: bool) -> None:
     """List persisted attachment metadata from SQLite without opening the PST.
@@ -536,7 +597,9 @@ def attachments(ctx: click.Context, message_id: str, json_output: bool) -> None:
     type=click.Path(dir_okay=False, path_type=str),
     help="New file path for the original attachment bytes.",
 )
-@click.option("--json", "json_output", is_flag=True, help="Render errors as JSON.")
+@click.option(
+    "--json", "json_output", is_flag=True, is_eager=True, help="Render errors as JSON."
+)
 @click.pass_context
 def attachment(
     ctx: click.Context, attachment_id: str, output: str, json_output: bool
@@ -623,8 +686,15 @@ def _command_error(error: Exception) -> CliContractError:
     return CliContractError(str(error), "invalid_request")
 
 
-def _json_requested(args: Sequence[str] | None) -> bool:
-    return args is not None and "--json" in args
+def _json_requested(error: click.ClickException) -> bool:
+    """Return whether Click parsed JSON output for the active command."""
+    contexts = (getattr(error, "ctx", None), click.get_current_context(silent=True))
+    for context in contexts:
+        while context is not None:
+            if context.params.get("json_output") is True:
+                return True
+            context = context.parent
+    return False
 
 
 if __name__ == "__main__":  # pragma: no cover

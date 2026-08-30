@@ -1,14 +1,18 @@
 ---
 id: TASK-007
 title: Harden json error detection and no-command UX
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@opencode'
 created_date: '2026-08-29 15:25'
+updated_date: '2026-08-30 06:12'
 labels:
   - code-review
   - polish
 dependencies: []
-references: []
+modified_files:
+  - pstq/cli.py
+  - tests/test_pstq.py
 priority: low
 type: enhancement
 ordinal: 7000
@@ -39,22 +43,38 @@ Two smaller robustness/UX issues in the CLI entry group:
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 JSON error envelopes are selected based on the parsed --json option, not a substring scan of raw argv
-- [ ] #2 A query or argument value equal to "--json" no longer changes the error output format
-- [ ] #3 Invoking pstq with no subcommand shows help or a clear error rather than exiting silently
-- [ ] #4 Legitimate onacol CLI config overrides continue to work
-- [ ] #5 Tests cover the "--json"-as-value case and the no-subcommand case
+- [x] #1 JSON error envelopes are selected based on the parsed --json option, not a substring scan of raw argv
+- [x] #2 A query or argument value equal to "--json" no longer changes the error output format
+- [x] #3 Invoking pstq with no subcommand shows help or a clear error rather than exiting silently
+- [x] #4 Legitimate onacol CLI config overrides continue to work
+- [x] #5 Tests cover the "--json"-as-value case and the no-subcommand case
 <!-- AC:END -->
 
 ## Implementation Plan
 
 <!-- SECTION:PLAN:BEGIN -->
-1. Route the error-format decision through parsed context state instead of `"--json" in args`.
-2. Emit help/usage (or an explicit error) when no subcommand is resolved, while preserving config-override forwarding.
-3. Add tests for the "--json"-as-value and no-command paths.
+1. Use the active Click context’s parsed `json_output` parameter when rendering handled errors.
+2. Render group help after configuration setup when no subcommand was resolved, leaving `ctx.args` available to onacol for configuration overrides.
+3. Add regression tests for `--json` as a positional query and no-subcommand help, then run the focused suite and static checks.
 <!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
+<!-- SECTION:NOTES:BEGIN -->
+
+Implementation: contract errors retain their active Click context; error rendering walks parsed context parameters for `json_output`. JSON flags are eager so Click records the selected mode before another option can fail parsing. Unknown top-level tokens are retained as Onacol arguments when no command resolves, then the group callback renders help after config validation.
+
+Verification: `.venv/bin/pytest` (131 passed); `.venv/bin/ruff check .` (passed); `.venv/bin/mypy pstq` (passed); `git diff --check` (passed, with only Git CRLF normalization warning for the pre-existing test file line ending).
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Replaced raw argv JSON detection with parsed Click context state, retained Onacol config overrides when no command resolves, and render help instead of silently succeeding. Added regressions for a literal `--json` query, bare no-command invocation, and no-command overrides. Verified with 131 passing tests, Ruff, MyPy, and diff checks. No ADRs or follow-up tasks.
+<!-- SECTION:FINAL_SUMMARY:END -->
+
+Initial investigation: `CliContractGroup.main()` chooses JSON formatting with a raw `"--json" in args` check. The group callback validates config and returns without output if no subcommand resolves; `ctx.args` carries Onacol overrides. Relevant coverage is in `tests/test_pstq.py`.
+<!-- SECTION:NOTES:END -->
+
 <!-- SECTION:NOTES:END -->

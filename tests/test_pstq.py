@@ -119,6 +119,25 @@ def test_get_config_template(tmp_path):
     assert "log_level: INFO" in output_path.read_text()
 
 
+def test_no_subcommand_shows_help_and_accepts_config_overrides():
+    runner = CliRunner()
+    no_command = runner.invoke(cli.main)
+    overridden_config = runner.invoke(
+        cli.main,
+        [
+            "--archive-pst-path",
+            "archive.pst",
+            "--archive-index-path",
+            "index.sqlite",
+        ],
+    )
+
+    assert no_command.exit_code == 0
+    assert "Usage:" in no_command.output
+    assert overridden_config.exit_code == 0
+    assert "compare-snapshots" in overridden_config.output
+
+
 def test_snapshot_command_writes_metadata(monkeypatch):
     class Report:
         message_count = 3
@@ -857,3 +876,22 @@ def test_json_errors_have_a_stable_envelope_and_no_traceback(
         "error": {"code": "synchronization_error", "message": "changed PST"}
     }
     assert "Traceback" not in runtime_error.output
+
+
+def test_json_like_query_value_does_not_select_json_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "sync_pst", lambda *_: None)
+    monkeypatch.setattr(
+        cli,
+        "search_messages",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("bad query")),
+    )
+
+    result = CliRunner().invoke(
+        cli.main,
+        ["--config", str(_archive_config(tmp_path)), "search", "--", "--json"],
+    )
+
+    assert result.exit_code == 1
+    assert result.output == "Error: bad query\n"
