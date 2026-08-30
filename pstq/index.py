@@ -30,7 +30,7 @@ from pstq.body import (
 )
 from pstq.pst import PstAttachment, PstFolder, PstMessage, PstReader
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 CLEANER_VERSION = 4
 
 _ORIGINAL_MESSAGE_SEPARATOR = re.compile(
@@ -387,10 +387,8 @@ def search_messages(
     ]
 
 
-def get_message(
-    database_path: str | Path, message_id: str, *, full: bool = False
-) -> dict[str, object]:
-    """Return a persisted message with its cleaned body unless FULL is requested."""
+def get_message(database_path: str | Path, message_id: str) -> dict[str, object]:
+    """Return a persisted message with its cleaned or derived body."""
     state = _require_index_state(database_path)
     recovered = _parse_recovered_record_id(message_id)
     if recovered is not None:
@@ -431,9 +429,9 @@ def get_message(
                    message.delivery_time, message.transport_headers,
                    message.internet_message_id, message.in_reply_to,
                    message.references_header, message.conversation_topic,
-                   message.conversation_index, message.attachment_count,
-                   message.body_raw, message.body_clean, message.body_format,
-                   folder.path
+                    message.conversation_index, message.attachment_count,
+                    message.body_clean, message.body_format,
+                    folder.path
             FROM message
             JOIN folder ON folder.store_uid = message.store_uid
                        AND folder.nid = message.folder_nid
@@ -444,7 +442,46 @@ def get_message(
         if row is None:
             raise ValueError(f"Message not found: {message_id}")
         recipients = _recipients_for_messages(connection, store_uid, ((nid,),))[nid]
-    return _message_record(store_uid, row, recipients, full=full)
+    return _message_record(store_uid, row, recipients)
+
+
+def get_full_message(
+    source_path: str | Path,
+    database_path: str | Path,
+    message_id: str,
+    history: HistorySettings = DEFAULT_HISTORY_SETTINGS,
+) -> dict[str, object]:
+    """Return a native message with its current preferred source body.
+
+    Recovered messages have no distinct PST item, so retain their derived body.
+    """
+    if _parse_recovered_record_id(message_id) is not None:
+        return get_message(database_path, message_id)
+
+    store_uid, message_nid = _parse_record_id(message_id)
+    sync_pst(source_path, database_path, history)
+    state = _require_index_state(database_path)
+    if store_uid != state.store_uid:
+        raise ValueError(f"Message ID does not belong to this index: {message_id}")
+    source = _source_state(source_path)
+    if source != state.source:
+        raise PstSynchronizationError("PST changed during full-body retrieval.")
+
+    record = get_message(database_path, message_id)
+    with sqlite3.connect(database_path) as connection:
+        folder_indexes, message_index = _message_locator(
+            connection, store_uid, message_nid
+        )
+    with PstReader(source_path) as reader:
+        if reader.store.uid != state.store_uid:
+            raise PstSynchronizationError("PST store does not match this index.")
+        body, body_format = reader.read_message_body(
+            folder_indexes, message_index, message_nid
+        )
+    _assert_source_unchanged(source)
+    record["body"] = _sqlite_optional_text(body)
+    record["body_format"] = body_format
+    return record
 
 
 def get_thread(database_path: str | Path, message_id: str) -> dict[str, object]:
@@ -489,9 +526,9 @@ def get_thread(database_path: str | Path, message_id: str) -> dict[str, object]:
                    message.delivery_time, message.transport_headers,
                    message.internet_message_id, message.in_reply_to,
                    message.references_header, message.conversation_topic,
-                   message.conversation_index, message.attachment_count,
-                   message.body_raw, message.body_clean, message.body_format,
-                   folder.path
+                    message.conversation_index, message.attachment_count,
+                    message.body_clean, message.body_format,
+                    folder.path
             FROM message
             JOIN folder ON folder.store_uid = message.store_uid
                        AND folder.nid = message.folder_nid
@@ -537,20 +574,18 @@ def _message_record(
     store_uid: str,
     row: Sequence[object],
     recipients: Sequence[str],
-    *,
-    full: bool = False,
 ) -> dict[str, object]:
     """Normalize one SQLite message row for command output."""
     return {
         "attachment_count": row[13],
-        "body": _sqlite_optional_text(row[14] if full else row[15]),
-        "body_format": _sqlite_optional_text(row[16]),
+        "body": _sqlite_optional_text(row[14]),
+        "body_format": _sqlite_optional_text(row[15]),
         "client_submit_time": _sqlite_optional_text(row[5]),
         "conversation_index": _sqlite_optional_text(row[12]),
         "conversation_topic": _sqlite_optional_text(row[11]),
         "date": _sqlite_optional_text(row[6] or row[5]),
         "delivery_time": _sqlite_optional_text(row[6]),
-        "folder": _sqlite_optional_text(row[17]),
+        "folder": _sqlite_optional_text(row[16]),
         "folder_id": _record_id(store_uid, cast(int, row[1])),
         "from": _sqlite_optional_text(row[4]),
         "id": _record_id(store_uid, cast(int, row[0])),
@@ -945,7 +980,6 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             conversation_topic_key TEXT,
             conversation_root TEXT,
             attachment_count INTEGER NOT NULL,
-            body_raw TEXT,
             body_clean TEXT,
             body_format TEXT,
             index_in_folder INTEGER NOT NULL,
@@ -1116,7 +1150,7 @@ def _upsert_message(
     generation: int,
     history: HistorySettings,
 ) -> None:
-    body_raw, body_format = _select_body(message)
+    body, body_format = _select_body(message)
     attachment_ids = {
         _normalize_content_id(attachment.content_id): _attachment_id(
             store_uid, message.nid, attachment.index
@@ -1126,7 +1160,7 @@ def _upsert_message(
     }
     # Keep quote CIDs unresolved so cached quote identity is independent of source
     # attachment changes; resolve them only in the native authored-body projection.
-    rendered_body = _render_body(body_raw, body_format, {})
+    rendered_body = _render_body(body, body_format, {})
     analysis = analyze_body(rendered_body, history.timezone)
     relationships = _relationships(message.transport_headers)
     internet_message_id = (
@@ -1146,9 +1180,9 @@ def _upsert_message(
             store_uid, nid, folder_nid, modification_time, subject, sender_name,
             client_submit_time, delivery_time, transport_headers, internet_message_id,
             in_reply_to, references_header, conversation_topic, conversation_index,
-            conversation_topic_key, conversation_root, attachment_count, body_raw,
-            body_clean, body_format, index_in_folder, last_seen_generation
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            conversation_topic_key, conversation_root, attachment_count, body_clean,
+            body_format, index_in_folder, last_seen_generation
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(store_uid, nid) DO UPDATE SET
             folder_nid = excluded.folder_nid,
             modification_time = excluded.modification_time,
@@ -1165,7 +1199,6 @@ def _upsert_message(
             conversation_topic_key = excluded.conversation_topic_key,
             conversation_root = excluded.conversation_root,
             attachment_count = excluded.attachment_count,
-            body_raw = excluded.body_raw,
             body_clean = excluded.body_clean,
             body_format = excluded.body_format,
             index_in_folder = excluded.index_in_folder,
@@ -1189,7 +1222,6 @@ def _upsert_message(
             _conversation_topic(conversation_topic),
             _conversation_root(conversation_index),
             message.attachment_count,
-            body_raw,
             _resolve_quoted_cid_images(
                 _clean_body_from_analysis(rendered_body, analysis) or "", attachment_ids
             )

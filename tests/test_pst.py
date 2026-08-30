@@ -357,6 +357,29 @@ def test_attachment_metadata_and_locator_extraction_use_anonymous_fixture(
     assert output.read_bytes() == b"anonymous image bytes"
 
 
+def test_read_message_body_uses_validated_locator_and_preferred_format(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "archive.pst"
+    path.touch()
+    pypff_file = FakePypffFile(b"store")
+    source_message = pypff_file.root_folder._folders[0]._messages[0]
+
+    with PstReader(path, pypff_module=FakePypff(pypff_file)) as reader:
+        body, body_format = reader.read_message_body((0,), 0, 200)
+        source_message.plain_text_body = None
+        html_body, html_format = reader.read_message_body((0,), 0, 200)
+        source_message.html_body = None
+        rtf_body, rtf_format = reader.read_message_body((0,), 0, 200)
+
+        with pytest.raises(pst.PstReaderError, match="does not match"):
+            reader.read_message_body((0,), 0, 999)
+
+    assert (body, body_format) == ("Plain body", "plain")
+    assert (html_body, html_format) == ("<p>HTML body</p>", "html")
+    assert (rtf_body, rtf_format) == ("RTF body", "rtf")
+
+
 def test_attachment_adapter_handles_unavailable_metadata_and_invalid_streams(
     tmp_path: Path,
 ) -> None:

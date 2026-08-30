@@ -473,18 +473,16 @@ def test_show_command_reads_only_the_persisted_message(
     }
 
 
-def test_show_command_selects_cleaned_or_full_body_for_all_output_modes(
+def test_show_command_selects_cleaned_or_source_body_for_all_output_modes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    full_arguments: list[bool] = []
+    calls: list[str] = []
 
-    def get_message_with_selected_body(
-        *_: object, full: bool = False
-    ) -> dict[str, object]:
-        full_arguments.append(full)
+    def get_cleaned_message(*_: object) -> dict[str, object]:
+        calls.append("clean")
         return {
             "attachment_count": 0,
-            "body": "Raw body" if full else "Clean body",
+            "body": "Clean body",
             "date": None,
             "folder": "Root/Inbox",
             "from": None,
@@ -493,7 +491,21 @@ def test_show_command_selects_cleaned_or_full_body_for_all_output_modes(
             "to": [],
         }
 
-    monkeypatch.setattr(cli, "get_message", get_message_with_selected_body)
+    def get_source_message(*_: object) -> dict[str, object]:
+        calls.append("source")
+        return {
+            "attachment_count": 0,
+            "body": "Source body",
+            "date": None,
+            "folder": "Root/Inbox",
+            "from": None,
+            "id": "store:3",
+            "subject": "Status",
+            "to": [],
+        }
+
+    monkeypatch.setattr(cli, "get_message", get_cleaned_message)
+    monkeypatch.setattr(cli, "get_full_message", get_source_message)
     config = ["--config", str(_archive_config(tmp_path)), "show", "store:3"]
     runner = CliRunner()
 
@@ -503,10 +515,10 @@ def test_show_command_selects_cleaned_or_full_body_for_all_output_modes(
     full_text = runner.invoke(cli.main, [*config, "--full"])
 
     assert json.loads(cleaned_json.output)["body"] == "Clean body"
-    assert json.loads(full_json.output)["body"] == "Raw body"
+    assert json.loads(full_json.output)["body"] == "Source body"
     assert cleaned_text.output.endswith("Clean body\n")
-    assert full_text.output.endswith("Raw body\n")
-    assert full_arguments == [False, True, False, True]
+    assert full_text.output.endswith("Source body\n")
+    assert calls == ["clean", "source", "clean", "source"]
 
 
 def test_thread_command_reads_only_the_persisted_index(

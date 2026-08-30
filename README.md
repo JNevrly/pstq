@@ -114,8 +114,10 @@ $ pstq --config pstq.yaml show edc4f1c4c743ad49a590c83842fd889f:2128196 --json
 $ pstq --config pstq.yaml show edc4f1c4c743ad49a590c83842fd889f:2128196 --full --json
 ```
 
-`show` reads only SQLite. It does not open the PST when the cache is available.
-Use `--full` to return the original raw body, including quoted history. The
+Default `show` reads only SQLite and returns persisted cleaned content. `show
+--full` synchronizes when needed, then reads the current preferred body from the
+configured PST, including quoted history. Recovered quoted-history records keep
+their persisted derived body because they have no independent source item. The
 same selection applies to human-readable and JSON output. The returned record
 includes the selected body representation, body format, participants, folder,
 message headers, relationship metadata, and attachment count.
@@ -136,7 +138,7 @@ be an IANA timezone and is applied to quoted timestamps that omit an offset.
 | `status [--json]` | Report source and cache metadata plus freshness. |
 | `folders [--json]` | List indexed folder paths and stable IDs. |
 | `search QUERY [filters] [--json]` | Synchronize when needed, then run a bounded FTS5 search. |
-| `show MESSAGE_ID [--full] [--json]` | Retrieve one persisted message from SQLite; cleaned body by default. |
+| `show MESSAGE_ID [--full] [--json]` | Retrieve cleaned content from SQLite, or use `--full` to read the current source body. |
 | `thread MESSAGE_ID [--json]` | Reconstruct a related-message view from persisted cache data. |
 | `attachments MESSAGE_ID [--json]` | List persisted attachment metadata from SQLite. |
 | `attachment ATTACHMENT_ID --output FILE` | Synchronize if needed, then extract one original attachment through its cached PST locator. `--output` must name a path that does not exist; PSTQ never overwrites an existing file. |

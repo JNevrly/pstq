@@ -314,17 +314,10 @@ class PstReader:
         output_path: str | Path,
     ) -> int:
         """Write an attachment through a cached stock-pypff traversal locator."""
-        folder = self._require_open().root_folder
-        if folder is None:
-            raise PstFileUnreadableError(f"PST has no root folder: {self.path}")
+        message = self._message_at_locator(
+            folder_indexes, message_index, message_nid
+        )
         try:
-            for folder_index in folder_indexes:
-                folder = folder.get_sub_folder(folder_index)
-            message = folder.get_sub_message(message_index)
-            if self._nid(message, "message") != message_nid:
-                raise PstReaderError(
-                    f"Cached locator does not match message {message_nid}."
-                )
             attachment = message.get_attachment(attachment_index)
             size = attachment.size
         except (AttributeError, IndexError, OSError) as error:
@@ -358,6 +351,66 @@ class PstReader:
             destination.unlink(missing_ok=True)
             raise
         return written
+
+    def read_message_body(
+        self,
+        folder_indexes: Sequence[int],
+        message_index: int,
+        message_nid: int,
+    ) -> tuple[str | bytes | None, str | None]:
+        """Read the preferred source body through a validated traversal locator."""
+        message = self._message_at_locator(
+            folder_indexes, message_index, message_nid
+        )
+        for property_name, body_format in (
+            ("plain_text_body", "plain"),
+            ("html_body", "html"),
+            ("rtf_body", "rtf"),
+        ):
+            try:
+                body = getattr(message, property_name)
+            except AttributeError:
+                body = None
+            except OSError as error:
+                raise PstReaderError(
+                    f"Unable to read {body_format} body for message {message_nid}."
+                ) from error
+            if body is not None:
+                if not isinstance(body, (str, bytes)):
+                    raise PstReaderError(
+                        f"Message {message_nid} has an invalid {body_format} body."
+                    )
+                return body, body_format
+        return None, None
+
+    def _message_at_locator(
+        self,
+        folder_indexes: Sequence[int],
+        message_index: int,
+        message_nid: int,
+    ) -> Any:
+        folder = self._require_open().root_folder
+        if folder is None:
+            raise PstFileUnreadableError(f"PST has no root folder: {self.path}")
+        try:
+            for folder_index in folder_indexes:
+                folder = folder.get_sub_folder(folder_index)
+            message = folder.get_sub_message(message_index)
+        except (AttributeError, IndexError, OSError) as error:
+            raise PstReaderError(
+                f"Unable to retrieve message {message_nid} through its cached locator."
+            ) from error
+        try:
+            actual_nid = self._nid(message, "message")
+        except (AttributeError, PstFileUnreadableError) as error:
+            raise PstReaderError(
+                f"Unable to retrieve message {message_nid} through its cached locator."
+            ) from error
+        if actual_nid != message_nid:
+            raise PstReaderError(
+                f"Cached locator does not match message {message_nid}."
+            )
+        return message
 
     def _attachments(self, message: Any) -> tuple[PstAttachment, ...]:
         count = self._optional_property(message, "number_of_attachments") or 0

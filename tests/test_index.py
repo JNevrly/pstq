@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from pstq import index
-from pstq.pst import PstAttachment, PstFolder, PstMessage, PstStore
+from pstq.pst import PstAttachment, PstFolder, PstMessage, PstReaderError, PstStore
 
 REAL_SOURCE_STATE = index._source_state
 
@@ -55,6 +55,7 @@ class FakeReader:
     store_uid = "store"
     walk_arguments: list[dict[str, object]] = []
     attachment_calls: list[tuple[tuple[int, ...], int, int, int, Path]] = []
+    body_calls: list[tuple[tuple[int, ...], int, int]] = []
 
     def __init__(self, _: str | Path) -> None:
         self.store = PstStore(self.store_uid)
@@ -102,6 +103,30 @@ class FakeReader:
         output_path.write_bytes(b"anonymous attachment")
         return len(b"anonymous attachment")
 
+    def read_message_body(
+        self,
+        folder_indexes: tuple[int, ...],
+        message_index: int,
+        message_nid: int,
+    ) -> tuple[str | bytes | None, str | None]:
+        self.body_calls.append((folder_indexes, message_index, message_nid))
+        folder = next(folder for folder in self.folders if folder.parent_nid is None)
+        for folder_index in folder_indexes:
+            folder = next(
+                child
+                for child in self.folders
+                if child.parent_nid == folder.nid
+                and child.index_in_parent == folder_index
+            )
+        message = next(
+            item for item in folder.messages if item.index_in_folder == message_index
+        )
+        if message.nid != message_nid:
+            raise PstReaderError(
+                f"Cached locator does not match message {message_nid}."
+            )
+        return index._select_body(message)
+
 
 def _records(*messages: PstMessage) -> tuple[PstFolder, ...]:
     return (
@@ -129,6 +154,7 @@ def fake_reader(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeReader.store_uid = "store"
     FakeReader.walk_arguments = []
     FakeReader.attachment_calls = []
+    FakeReader.body_calls = []
     FakeReader.folders = _records(_message())
     monkeypatch.setattr(index, "PstReader", FakeReader)
     source = [index._SourceState("archive.pst", 1, 1)]
@@ -162,7 +188,7 @@ def test_import_pst_creates_normalized_cache(tmp_path: Path) -> None:
         database_path,
         """
         SELECT nid, folder_nid, modification_time, subject, sender_name,
-               client_submit_time, delivery_time, body_raw, body_clean, body_format,
+               client_submit_time, delivery_time, body_clean, body_format,
                internet_message_id, in_reply_to, references_header,
                conversation_topic, conversation_index, attachment_count, index_in_folder
         FROM message
@@ -176,7 +202,6 @@ def test_import_pst_creates_normalized_cache(tmp_path: Path) -> None:
             "Sender",
             "2026-08-20T12:00:00",
             "2026-08-20T12:30:00",
-            "Plain body",
             "Plain body",
             "plain",
             "<message@example.test>",
@@ -602,6 +627,16 @@ def test_thread_includes_deduplicated_owner_history_and_suppresses_native_duplic
         "to": ["recipient@example.test"],
     }
     assert index.get_message(database_path, recovered["id"]) == recovered
+    assert (
+        index.get_full_message(
+            "archive.pst",
+            database_path,
+            recovered["id"],
+            index.HistorySettings(("owner@example.test",), (), "Europe/Prague"),
+        )
+        == recovered
+    )
+    assert FakeReader.body_calls == []
     assert recovered["id"] in [
         message["id"]
         for message in index.get_thread(database_path, recovered["id"])["messages"]
@@ -862,7 +897,7 @@ def test_thread_parsers_ignore_malformed_values() -> None:
 @pytest.mark.parametrize(
     ("message", "expected"),
     [
-        (_message(plain_text_body=None), ("<p>HTML body</p>", "html")),
+        (_message(plain_text_body=None), ("HTML body", "html")),
         (_message(plain_text_body=None, html_body=None), ("RTF body", "rtf")),
         (_message(plain_text_body=None, html_body=None, rtf_body=None), (None, None)),
     ],
@@ -875,7 +910,7 @@ def test_import_pst_selects_the_best_available_body(
 
     index.import_pst("archive.pst", database_path)
 
-    assert _rows(database_path, "SELECT body_raw, body_format FROM message") == [
+    assert _rows(database_path, "SELECT body_clean, body_format FROM message") == [
         expected
     ]
 
@@ -1182,19 +1217,100 @@ def test_clean_body_keeps_ambiguous_content_searchable(tmp_path: Path) -> None:
     assert index.search_messages(database_path, "ambiguous")
 
 
-def test_import_preserves_raw_body_and_indexes_cleaned_body(tmp_path: Path) -> None:
+def test_import_omits_raw_body_and_indexes_cleaned_body(tmp_path: Path) -> None:
     body = "Current content.\n-----Original Message-----\nQuoted content."
     FakeReader.folders = _records(_message(plain_text_body=body))
     database_path = tmp_path / "index.sqlite"
 
     index.import_pst("archive.pst", database_path)
 
-    rows = _rows(database_path, "SELECT body_raw, body_clean, body_format FROM message")
-    assert rows == [(body, "Current content.\n", "plain")]
+    rows = _rows(database_path, "SELECT body_clean, body_format FROM message")
+    assert rows == [("Current content.\n", "plain")]
+    assert "body_raw" not in {
+        row[1] for row in _rows(database_path, "PRAGMA table_info(message)")
+    }
     assert index.get_message(database_path, "store:3")["body"] == "Current content.\n"
-    assert index.get_message(database_path, "store:3", full=True)["body"] == body
     assert index.search_messages(database_path, "Current")
     assert index.search_messages(database_path, "Quoted") == []
+
+
+def test_get_full_message_reads_the_current_source_body(tmp_path: Path) -> None:
+    cached = "Cached content.\n-----Original Message-----\nQuoted content."
+    source = "Current source content.\n-----Original Message-----\nQuoted content."
+    FakeReader.folders = _records(_message(plain_text_body=cached))
+    database_path = tmp_path / "index.sqlite"
+    index.import_pst("archive.pst", database_path)
+    FakeReader.folders = _records(_message(plain_text_body=source))
+
+    message = index.get_full_message("archive.pst", database_path, "store:3")
+
+    assert message["body"] == source
+    assert message["body_format"] == "plain"
+    assert index.get_message(database_path, "store:3")["body"] == "Cached content.\n"
+    assert FakeReader.body_calls == [((0,), 0, 3)]
+
+
+def test_get_full_message_synchronizes_reordered_locators(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = [index._SourceState("archive.pst", 1, 1)]
+    monkeypatch.setattr(index, "_source_state", lambda _: source[0])
+    database_path = tmp_path / "index.sqlite"
+    message = _message(plain_text_body="Current source body")
+    FakeReader.folders = _records(message)
+    index.import_pst("archive.pst", database_path)
+    source[0] = index._SourceState("archive.pst", 2, 2)
+    FakeReader.folders = (
+        PstFolder(1, None, "Root", "Root", ()),
+        PstFolder(
+            2,
+            1,
+            "Inbox",
+            "Root/Inbox",
+            (replace(message, index_in_folder=1),),
+            index_in_parent=1,
+        ),
+    )
+
+    message_record = index.get_full_message("archive.pst", database_path, "store:3")
+
+    assert message_record["body"] == "Current source body"
+    assert FakeReader.body_calls == [((1,), 1, 3)]
+
+
+def test_get_full_message_rejects_store_and_body_read_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "index.sqlite"
+    index.import_pst("archive.pst", database_path)
+    FakeReader.store_uid = "other"
+
+    with pytest.raises(index.PstSynchronizationError, match="does not match"):
+        index.get_full_message("archive.pst", database_path, "store:3")
+
+    FakeReader.store_uid = "store"
+    monkeypatch.setattr(
+        FakeReader,
+        "read_message_body",
+        lambda *_: (_ for _ in ()).throw(PstReaderError("body unavailable")),
+    )
+    with pytest.raises(PstReaderError, match="body unavailable"):
+        index.get_full_message("archive.pst", database_path, "store:3")
+
+
+def test_get_full_message_fails_when_the_source_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "index.sqlite"
+    index.import_pst("archive.pst", database_path)
+    monkeypatch.setattr(
+        index,
+        "_source_state",
+        lambda _: (_ for _ in ()).throw(OSError("source unavailable")),
+    )
+
+    with pytest.raises(OSError, match="source unavailable"):
+        index.get_full_message("archive.pst", database_path, "store:3")
 
 
 def test_import_preserves_byte_body_and_indexes_decoded_cleaned_body(
@@ -1206,8 +1322,8 @@ def test_import_preserves_byte_body_and_indexes_decoded_cleaned_body(
 
     index.import_pst("archive.pst", database_path)
 
-    rows = _rows(database_path, "SELECT body_raw, body_clean, body_format FROM message")
-    assert rows == [(body, "Current content.\n", "plain")]
+    rows = _rows(database_path, "SELECT body_clean, body_format FROM message")
+    assert rows == [("Current content.\n", "plain")]
     assert index.search_messages(database_path, "Current")
     assert index.search_messages(database_path, "Quoted") == []
 
@@ -1383,12 +1499,12 @@ def test_import_pst_replaces_the_cache_only_after_a_successful_import(
 def test_import_pst_rebuilds_an_equivalent_deleted_cache(tmp_path: Path) -> None:
     database_path = tmp_path / "index.sqlite"
     index.import_pst("archive.pst", database_path)
-    expected = _rows(database_path, "SELECT nid, body_raw FROM message")
+    expected = _rows(database_path, "SELECT nid, body_clean FROM message")
     database_path.unlink()
 
     index.import_pst("archive.pst", database_path)
 
-    assert _rows(database_path, "SELECT nid, body_raw FROM message") == expected
+    assert _rows(database_path, "SELECT nid, body_clean FROM message") == expected
 
 
 def test_import_pst_preserves_an_existing_cache_when_replacement_fails(
@@ -1455,6 +1571,28 @@ def test_sync_pst_rebuilds_when_the_cleaner_version_changes(
     ]
 
 
+def test_sync_pst_rebuilds_when_the_schema_version_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = [index._SourceState("archive.pst", 1, 1)]
+    monkeypatch.setattr(index, "_source_state", lambda _: source[0])
+    database_path = tmp_path / "index.sqlite"
+    index.import_pst("archive.pst", database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("UPDATE index_state SET schema_version = ?", (11,))
+    FakeReader.walk_arguments = []
+
+    result = index.sync_pst("archive.pst", database_path)
+
+    assert result.full is True
+    assert FakeReader.walk_arguments == [
+        {"include_bodies": True, "include_body_nids": None}
+    ]
+    assert "body_raw" not in {
+        row[1] for row in _rows(database_path, "PRAGMA table_info(message)")
+    }
+
+
 def test_sync_pst_rebuilds_derived_history_when_owner_context_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1510,7 +1648,7 @@ def test_sync_pst_reloads_only_new_and_modified_message_bodies(
         {"include_bodies": False, "include_body_nids": None},
         {"include_bodies": False, "include_body_nids": {3, 4}},
     ]
-    assert _rows(database_path, "SELECT nid, body_raw FROM message ORDER BY nid") == [
+    assert _rows(database_path, "SELECT nid, body_clean FROM message ORDER BY nid") == [
         (3, "Changed body"),
         (4, "New body"),
     ]
@@ -1538,7 +1676,7 @@ def test_sync_pst_updates_only_folder_for_same_nid_move(
     assert FakeReader.walk_arguments == [
         {"include_bodies": False, "include_body_nids": None}
     ]
-    assert _rows(database_path, "SELECT folder_nid, body_raw FROM message") == [
+    assert _rows(database_path, "SELECT folder_nid, body_clean FROM message") == [
         (4, "Plain body")
     ]
 
@@ -1806,7 +1944,7 @@ def test_get_message_decodes_byte_valued_fields_for_json(tmp_path: Path) -> None
     index.import_pst("archive.pst", database_path)
     with sqlite3.connect(database_path) as connection:
         connection.execute(
-            "UPDATE message SET body_raw = ? WHERE store_uid = ? AND nid = ?",
+            "UPDATE message SET body_clean = ? WHERE store_uid = ? AND nid = ?",
             (b"Body with invalid byte: \xff", "store", 3),
         )
         connection.execute(
@@ -1818,7 +1956,7 @@ def test_get_message_decodes_byte_valued_fields_for_json(tmp_path: Path) -> None
             ("store", 3, 0, "to", None, b"recipient\xff@example.test"),
         )
 
-    message = index.get_message(database_path, "store:3", full=True)
+    message = index.get_message(database_path, "store:3")
 
     assert message["body"] == "Body with invalid byte: \ufffd"
     assert message["to"] == ["recipient\ufffd@example.test"]

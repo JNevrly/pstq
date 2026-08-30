@@ -16,6 +16,7 @@ from pstq.index import (
     HistorySettings,
     PstSynchronizationError,
     extract_attachment,
+    get_full_message,
     get_message,
     get_thread,
     index_status,
@@ -142,9 +143,10 @@ def main(ctx: click.Context, config: str | None, get_config_template: Any) -> No
 
     Safety and synchronization:
       PST files are always opened read-only and are never modified. SQLite is a
-      disposable cache, not a source of truth. search and attachment synchronize
-      first when source path, size, mtime, schema, or cleaner version differs;
-      status, folders, show, thread, and attachments read SQLite only. Do not
+       disposable cache, not a source of truth. search, attachment extraction, and
+       show --full synchronize first when source path, size, mtime, schema, or
+       cleaner version differs; status, folders, default show, and thread read
+       SQLite only. Do not
       run against a PST Outlook is modifying. libpff/pypff can fail on malformed
       or unsupported PST structures, and stock pypff has no direct item lookup;
       attachment extraction uses a cached, validated traversal locator instead.
@@ -456,7 +458,7 @@ def search(
     "--full",
     "full_body",
     is_flag=True,
-    help="Show the original raw body instead of cleaned content.",
+    help="Read the current preferred source body instead of cleaned content.",
 )
 @click.option(
     "--json",
@@ -469,12 +471,13 @@ def search(
 def show(
     ctx: click.Context, message_id: str, full_body: bool, json_output: bool
 ) -> None:
-    """Display one persisted message from SQLite; use --full for raw body.
+    """Display one persisted message; use --full for the current source body.
 
     MESSAGE_ID must be a stable selector returned by search. The default body is
-    conservatively cleaned of recognizable quoted history; --full selects the
-    preserved raw body where available in both text and JSON output. This command
-    does not open or synchronize the PST.
+    conservatively cleaned of recognizable quoted history. --full synchronizes and
+    reads the current preferred native body from the PST where available; recovered
+    records retain their persisted derived body. Default output does not open or
+    synchronize the PST.
 
     --json returns {attachment_count, body, body_format, client_submit_time,
     conversation_index, conversation_topic, date, delivery_time, folder,
@@ -483,10 +486,16 @@ def show(
     PST did not expose that property. id is a stable selector; folder_id is a
     stable STORE_UID:NID value.
     """
-    _, database_path = _configured_paths(ctx)
+    source_path, database_path = _configured_paths(ctx)
     try:
-        message = get_message(database_path, message_id, full=full_body)
-    except (OSError, ValueError) as error:
+        message = (
+            get_full_message(
+                source_path, database_path, message_id, _history_settings(ctx)
+            )
+            if full_body
+            else get_message(database_path, message_id)
+        )
+    except (OSError, PstReaderError, PstSynchronizationError, ValueError) as error:
         raise _command_error(error) from error
     if json_output:
         click.echo(_json(message), nl=False)
