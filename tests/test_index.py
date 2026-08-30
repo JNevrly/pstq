@@ -764,6 +764,81 @@ def test_incremental_sync_removes_recovered_search_documents(
     ) == [(0,)]
 
 
+def test_incremental_sync_reuses_cached_quotes_and_global_deduplication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = [index._SourceState("archive.pst", 1, 1)]
+    monkeypatch.setattr(index, "_source_state", lambda _: source[0])
+    database_path = tmp_path / "index.sqlite"
+    alpha = (
+        "-----Original Message-----\nFrom: Owner <owner@example.test>\n"
+        "Sent: 20.08.2026 10:00\nTo: Recipient\nSubject: Alpha\nCommon alpha"
+    )
+    beta = (
+        "-----Original Message-----\nFrom: Owner <owner@example.test>\n"
+        "Sent: 21.08.2026 10:00\nTo: Recipient\nSubject: Beta\nCommon beta"
+    )
+    history = index.HistorySettings(("owner@example.test",), (), "UTC")
+    FakeReader.folders = _records(
+        _message(nid=3, plain_text_body="Current native message"),
+        _message(nid=4, plain_text_body=f"Current\n{alpha}"),
+        _message(nid=5, plain_text_body=f"Current\n{beta}"),
+    )
+    index.import_pst("archive.pst", database_path, history)
+
+    analyzed: list[str | bytes | None] = []
+    rendered: list[str | bytes | None] = []
+    analyze_body = index.analyze_body
+    render_body = index._render_body
+
+    def counting_analyze(body: str | bytes | None, timezone_name: str):
+        analyzed.append(body)
+        return analyze_body(body, timezone_name)
+
+    def counting_render(
+        body: str | bytes | None,
+        body_format: str | None,
+        attachment_ids: dict[str, str],
+    ) -> str | bytes | None:
+        rendered.append(body)
+        return render_body(body, body_format, attachment_ids)
+
+    monkeypatch.setattr(index, "analyze_body", counting_analyze)
+    monkeypatch.setattr(index, "_render_body", counting_render)
+    FakeReader.folders = _records(
+        replace(
+            _message(nid=3, plain_text_body="Common alpha"),
+            modification_time=datetime(2026, 8, 21, 12, 30),
+            sender_name="Owner",
+            subject="Alpha",
+            transport_headers="From: Owner <owner@example.test>\n",
+        ),
+        _message(nid=4, plain_text_body=f"Current\n{alpha}"),
+        _message(nid=5, plain_text_body=f"Current\n{beta}"),
+    )
+    source[0] = index._SourceState("archive.pst", 2, 2)
+
+    result = index.sync_pst("archive.pst", database_path, history)
+
+    assert result.modified_count == 1
+    assert analyzed == ["Common alpha"]
+    assert rendered == ["Common alpha"]
+    assert _rows(
+        database_path,
+        "SELECT subject FROM recovered_message ORDER BY subject",
+    ) == [("Beta",)]
+    assert _rows(
+        database_path,
+        "SELECT source_message_nid FROM quote_occurrence",
+    ) == [(5,)]
+    assert {
+        result.subject for result in index.search_messages(database_path, "Common")
+    } == {
+        "Alpha",
+        "Beta",
+    }
+
+
 def test_thread_parsers_ignore_malformed_values() -> None:
     assert index._thread_index("not base64") is None
     assert index._conversation_root("zz" * 22) is None
@@ -1102,6 +1177,8 @@ def test_clean_body_keeps_ambiguous_content_searchable(tmp_path: Path) -> None:
         "From: sender\nSent: today\nTo: recipient"
     )
     assert index.clean_body("From: sender") == "From: sender"
+    assert index.clean_body(None) is None
+    assert index.clean_body(b"byte body") == "byte body"
     assert index.search_messages(database_path, "ambiguous")
 
 

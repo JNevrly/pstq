@@ -22,6 +22,7 @@ from typing import cast
 
 from pstq.body import (
     ANALYZER_VERSION,
+    BodyAnalysis,
     QuotedMessage,
     analyze_body,
     is_owner,
@@ -29,7 +30,7 @@ from pstq.body import (
 )
 from pstq.pst import PstAttachment, PstFolder, PstMessage, PstReader
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 CLEANER_VERSION = 4
 
 _ORIGINAL_MESSAGE_SEPARATOR = re.compile(
@@ -732,7 +733,7 @@ def _incremental_sync(
                 connection, store_uid, folders, generation
             )
             _load_changed_bodies(
-                connection, source_path, store_uid, body_nids, generation
+                connection, source_path, store_uid, body_nids, generation, history
             )
             _delete_search_documents(
                 connection,
@@ -846,6 +847,7 @@ def _load_changed_bodies(
     store_uid: str,
     body_nids: set[int],
     generation: int,
+    history: HistorySettings,
 ) -> None:
     if not body_nids:
         return
@@ -856,7 +858,7 @@ def _load_changed_bodies(
         for folder in reader.walk(include_body_nids=body_nids):
             for message in folder.messages:
                 if message.nid in body_nids:
-                    _upsert_message(connection, store_uid, message, generation)
+                    _upsert_message(connection, store_uid, message, generation, history)
                     found.add(message.nid)
     if found != body_nids:
         raise PstSynchronizationError("PST messages changed during synchronization.")
@@ -880,7 +882,9 @@ def _write_index(
                 _upsert_folder(connection, store_uid, folder, generation=1)
                 folder_count += 1
                 for message in folder.messages:
-                    _upsert_message(connection, store_uid, message, generation=1)
+                    _upsert_message(
+                        connection, store_uid, message, generation=1, history=history
+                    )
                     message_count += 1
             _assert_source_unchanged(source)
             _rebuild_recovered_messages(connection, store_uid, history)
@@ -1023,6 +1027,24 @@ def _create_schema(connection: sqlite3.Connection) -> None:
                 REFERENCES recovered_message(store_uid, fingerprint) ON DELETE CASCADE
         );
 
+        CREATE TABLE quote_cache (
+            store_uid TEXT NOT NULL,
+            source_message_nid INTEGER NOT NULL,
+            quote_index INTEGER NOT NULL,
+            fingerprint TEXT NOT NULL,
+            sender TEXT NOT NULL,
+            sender_email TEXT,
+            recipients_json TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            sent_at TEXT,
+            sent_raw TEXT NOT NULL,
+            body TEXT NOT NULL,
+            relation TEXT NOT NULL,
+            PRIMARY KEY (store_uid, source_message_nid, quote_index),
+            FOREIGN KEY (store_uid, source_message_nid)
+                REFERENCES message(store_uid, nid) ON DELETE CASCADE
+        );
+
         CREATE TABLE search_document (
             store_uid TEXT NOT NULL REFERENCES store(uid),
             selector TEXT NOT NULL,
@@ -1092,8 +1114,20 @@ def _upsert_message(
     store_uid: str,
     message: PstMessage,
     generation: int,
+    history: HistorySettings,
 ) -> None:
     body_raw, body_format = _select_body(message)
+    attachment_ids = {
+        _normalize_content_id(attachment.content_id): _attachment_id(
+            store_uid, message.nid, attachment.index
+        )
+        for attachment in message.attachments
+        if attachment.content_id
+    }
+    # Keep quote CIDs unresolved so cached quote identity is independent of source
+    # attachment changes; resolve them only in the native authored-body projection.
+    rendered_body = _render_body(body_raw, body_format, {})
+    analysis = analyze_body(rendered_body, history.timezone)
     relationships = _relationships(message.transport_headers)
     internet_message_id = (
         message.internet_message_id or relationships["internet_message_id"]
@@ -1156,19 +1190,11 @@ def _upsert_message(
             _conversation_root(conversation_index),
             message.attachment_count,
             body_raw,
-            clean_body(
-                _render_body(
-                    body_raw,
-                    body_format,
-                    {
-                        _normalize_content_id(attachment.content_id): _attachment_id(
-                            store_uid, message.nid, attachment.index
-                        )
-                        for attachment in message.attachments
-                        if attachment.content_id
-                    },
-                )
-            ),
+            _resolve_quoted_cid_images(
+                _clean_body_from_analysis(rendered_body, analysis) or "", attachment_ids
+            )
+            if rendered_body is not None
+            else None,
             body_format,
             message.index_in_folder,
             generation,
@@ -1184,6 +1210,9 @@ def _upsert_message(
     )
     _replace_recipients(connection, store_uid, message.nid, message.transport_headers)
     _replace_attachments(connection, store_uid, message.nid, message.attachments)
+    _replace_quote_cache(
+        connection, store_uid, message.nid, analysis.quoted_messages, history
+    )
     _index_message(connection, store_uid, message.nid)
 
 
@@ -1341,7 +1370,13 @@ def clean_body(body: str | bytes | None) -> str | None:
         return None
     if isinstance(body, bytes):
         body = _decode_sqlite_text(body)
-    analysis = analyze_body(body, "UTC")
+    return _clean_body_from_analysis(body, analyze_body(body, "UTC"))
+
+
+def _clean_body_from_analysis(body: str | bytes, analysis: BodyAnalysis) -> str | None:
+    """Use an existing analysis when cleaning a body for native search."""
+    if isinstance(body, bytes):
+        body = _decode_sqlite_text(body)
     if analysis.quoted_messages:
         return analysis.authored_body
     lines = body.splitlines(keepends=True)
@@ -1649,6 +1684,50 @@ def _replace_attachments(
     )
 
 
+def _replace_quote_cache(
+    connection: sqlite3.Connection,
+    store_uid: str,
+    message_nid: int,
+    quotes: Sequence[QuotedMessage],
+    history: HistorySettings,
+) -> None:
+    """Persist owner quotes extracted while the native body is already analyzed."""
+    connection.execute(
+        "DELETE FROM quote_cache WHERE store_uid = ? AND source_message_nid = ?",
+        (store_uid, message_nid),
+    )
+    if not history.enabled:
+        return
+    owner_emails = frozenset(value.strip().casefold() for value in history.owner_emails)
+    owner_names = frozenset(_normalized_name(value) for value in history.owner_names)
+    connection.executemany(
+        """
+        INSERT INTO quote_cache (
+            store_uid, source_message_nid, quote_index, fingerprint, sender,
+            sender_email, recipients_json, subject, sent_at, sent_raw, body, relation
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                store_uid,
+                message_nid,
+                quote.index,
+                quote.fingerprint,
+                quote.sender,
+                quote.sender_email,
+                json.dumps(quote.recipients),
+                quote.subject,
+                quote.sent_at,
+                quote.sent_raw,
+                quote.body,
+                quote.relation,
+            )
+            for quote in quotes
+            if quote.body and is_owner(quote, owner_emails, owner_names)
+        ],
+    )
+
+
 def _index_message(connection: sqlite3.Connection, store_uid: str, nid: int) -> None:
     row = connection.execute(
         """
@@ -1793,7 +1872,7 @@ def _delete_search_documents(
 def _rebuild_recovered_messages(
     connection: sqlite3.Connection, store_uid: str, history: HistorySettings
 ) -> None:
-    """Recreate derived quote records from native bodies in this transaction."""
+    """Recreate derived quote records from the per-message quote cache."""
     _delete_search_documents(
         connection,
         "store_uid = ? AND recovered_fingerprint IS NOT NULL",
@@ -1805,36 +1884,38 @@ def _rebuild_recovered_messages(
     )
     if not history.enabled:
         return
-    owner_emails = frozenset(value.strip().casefold() for value in history.owner_emails)
-    owner_names = frozenset(_normalized_name(value) for value in history.owner_names)
     native_rows = connection.execute(
         """
-        SELECT nid, sender_name, subject, client_submit_time, delivery_time,
-               transport_headers, body_raw, body_clean, body_format
+        SELECT sender_name, subject, transport_headers, body_clean
         FROM message WHERE store_uid = ?
         """,
         (store_uid,),
     ).fetchall()
     native_fingerprints = {
         native_fingerprint(
-            row[1], _header_sender_email(_sqlite_optional_text(row[5])), row[2], row[7]
+            row[0], _header_sender_email(_sqlite_optional_text(row[2])), row[1], row[3]
         )
         for row in native_rows
     }
-    recovered: dict[str, QuotedMessage] = {}
+    cached_rows = connection.execute(
+        """
+        SELECT source_message_nid, quote_index, fingerprint, sender, sender_email,
+               recipients_json, subject, sent_at, sent_raw, body, relation
+        FROM quote_cache WHERE store_uid = ?
+        ORDER BY source_message_nid, quote_index
+        """,
+        (store_uid,),
+    ).fetchall()
+    recovered: dict[str, Sequence[object]] = {}
     occurrences: list[tuple[str, int, str, int]] = []
-    for row in native_rows:
-        rendered = _render_body(row[6], _sqlite_optional_text(row[8]), {})
-        analysis = analyze_body(rendered, history.timezone)
-        for quote in analysis.quoted_messages:
-            if (
-                not quote.body
-                or not is_owner(quote, owner_emails, owner_names)
-                or quote.fingerprint in native_fingerprints
-            ):
-                continue
-            recovered.setdefault(quote.fingerprint, quote)
-            occurrences.append((store_uid, row[0], quote.fingerprint, quote.index))
+    for row in cached_rows:
+        fingerprint = cast(str, row[2])
+        if fingerprint in native_fingerprints:
+            continue
+        recovered.setdefault(fingerprint, row)
+        occurrences.append(
+            (store_uid, cast(int, row[0]), fingerprint, cast(int, row[1]))
+        )
     connection.executemany(
         """
         INSERT INTO recovered_message (
@@ -1846,16 +1927,16 @@ def _rebuild_recovered_messages(
             (
                 store_uid,
                 fingerprint,
-                quote.sender,
-                quote.sender_email,
-                json.dumps(quote.recipients),
-                quote.subject,
-                quote.sent_at,
-                quote.sent_raw,
-                quote.body,
-                quote.relation,
+                row[3],
+                row[4],
+                row[5],
+                row[6],
+                row[7],
+                row[8],
+                row[9],
+                row[10],
             )
-            for fingerprint, quote in recovered.items()
+            for fingerprint, row in recovered.items()
         ],
     )
     connection.executemany(
