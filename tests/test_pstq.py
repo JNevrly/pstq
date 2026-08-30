@@ -356,7 +356,7 @@ def test_search_command_synchronizes_and_returns_lightweight_json(
     )
 
     assert result.exit_code == 0
-    assert synchronized == [("archive.pst", "index.sqlite")]
+    assert synchronized == [("archive.pst", "index.sqlite", cli.HistorySettings())]
     assert json.loads(result.output) == [
         {
             "date": "2026-08-20T12:30:00",
@@ -587,11 +587,17 @@ def test_attachment_commands_list_metadata_and_extract_bytes(
             "size": 20,
         }
     ]
-    calls: list[tuple[str, str, str, str]] = []
+    calls: list[tuple[object, ...]] = []
     monkeypatch.setattr(cli, "list_attachments", lambda *_: values)
 
-    def extract(source: str, database: str, attachment_id: str, output: str) -> int:
-        calls.append((source, database, attachment_id, output))
+    def extract(
+        source: str,
+        database: str,
+        attachment_id: str,
+        output: str,
+        history: cli.HistorySettings,
+    ) -> int:
+        calls.append((source, database, attachment_id, output, history))
         return 20
 
     monkeypatch.setattr(cli, "extract_attachment", extract)
@@ -608,7 +614,9 @@ def test_attachment_commands_list_metadata_and_extract_bytes(
     assert listed.output == "store:3:0  anonymous-image.png  image/png  20\n"
     assert json.loads(listed_json.output) == values
     assert extracted.output == "Wrote 20 bytes to image.png\n"
-    assert calls == [("archive.pst", "index.sqlite", "store:3:0", "image.png")]
+    assert calls == [
+        ("archive.pst", "index.sqlite", "store:3:0", "image.png", cli.HistorySettings())
+    ]
 
 
 def test_attachment_passes_owner_history_settings_to_synchronization(

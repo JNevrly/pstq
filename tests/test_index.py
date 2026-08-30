@@ -369,8 +369,7 @@ def test_get_thread_queries_the_indexed_relationship_component(
         _thread_message(
             11,
             headers=(
-                "Message-ID: <reply@example.test>\n"
-                "In-Reply-To: <root@example.test>"
+                "Message-ID: <reply@example.test>\nIn-Reply-To: <root@example.test>"
             ),
             body="Reply",
             delivery_time=datetime(2026, 8, 20, 11),

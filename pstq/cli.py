@@ -7,12 +7,12 @@ from collections.abc import Sequence
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import click
 from onacol import ConfigManager, ConfigValidationError  # type: ignore[import-untyped]
 
 from pstq.index import (
-    DEFAULT_HISTORY_SETTINGS,
     HistorySettings,
     PstSynchronizationError,
     extract_attachment,
@@ -425,10 +425,7 @@ def search(
                 "history.owner_names.",
                 "configuration_error",
             )
-        if history == DEFAULT_HISTORY_SETTINGS:
-            sync_pst(source_path, database_path)
-        else:
-            sync_pst(source_path, database_path, history)
+        sync_pst(source_path, database_path, history)
         values = search_messages(
             database_path,
             query,
@@ -616,14 +613,9 @@ def attachment(
     source_path, database_path = _configured_paths(ctx)
     try:
         history = _history_settings(ctx)
-        if history == DEFAULT_HISTORY_SETTINGS:
-            written = extract_attachment(
-                source_path, database_path, attachment_id, output
-            )
-        else:
-            written = extract_attachment(
-                source_path, database_path, attachment_id, output, history
-            )
+        written = extract_attachment(
+            source_path, database_path, attachment_id, output, history
+        )
     except FileExistsError as error:
         raise CliContractError(
             f"Output path already exists and will not be overwritten: {output}",
@@ -662,8 +654,6 @@ def _history_settings(ctx: click.Context) -> HistorySettings:
         or not isinstance(timezone, str)
     ):
         raise CliContractError("Invalid history configuration.", "configuration_error")
-    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
     try:
         ZoneInfo(timezone)
     except ZoneInfoNotFoundError as error:
