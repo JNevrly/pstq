@@ -122,8 +122,9 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-  publish-pypi:
+  publish_pypi:
     name: Publish to PyPI
+    if: ${{ !inputs.skip_pypi }}
     needs: build
     runs-on: ubuntu-latest
     environment:
@@ -139,7 +140,6 @@ jobs:
           path: dist/
 
       - name: Publish package distributions to PyPI
-        if: ${{ !inputs.skip_pypi }}
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: dist/
@@ -148,7 +148,10 @@ jobs:
     name: Create GitHub Release
     needs:
       - build
-      - publish-pypi
+      - publish_pypi
+    if: >-
+      ${{ always() && needs.build.result == 'success' &&
+      (needs.publish_pypi.result == 'success' || needs.publish_pypi.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write

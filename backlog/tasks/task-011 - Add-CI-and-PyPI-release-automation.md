@@ -4,7 +4,7 @@ title: Add CI and PyPI release automation
 status: In Progress
 assignee: []
 created_date: '2026-08-31 08:50'
-updated_date: '2026-08-31 11:20'
+updated_date: '2026-08-31 11:56'
 labels: []
 dependencies: []
 references:
@@ -31,7 +31,7 @@ Add GitHub Actions quality checks and a secure tag-driven release workflow for t
 - [ ] #2 Pushing an exact vX.Y.Z tag validates that it matches the package version and changelog, then builds and validates wheel and source distributions
 - [ ] #3 A separate least-privileged job publishes validated artifacts to PyPI through the pypi GitHub environment using OIDC
 - [ ] #4 A successful PyPI publication creates a GitHub Release with the built distributions attached
-- [ ] #5 The release workflow supports manual recovery for an existing release tag
+- [ ] #5 Manual recovery for an already-published tag skips the entire PyPI environment job and creates the missing GitHub Release
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -55,6 +55,8 @@ TASK-012 restored the quality baseline: the complete tox suite passes with 141 t
 Updated CHANGELOG.md to record 2026-08-31 as the first public release date for version 0.1.0.
 
 First release published PyPI version 0.1.0 successfully, but GitHub Release creation failed because the job had no Git checkout for gh release create --verify-tag. Added a pinned checkout of the validated tag to the GitHub Release job. Workflow YAML parsing and zizmor security checks pass. Recovery requires a manual release run for tag v0.1.0 with PyPI skipped.
+
+Manual recovery initially entered the pypi environment even with publishing skipped, so tag-only environment rules rejected a run dispatched from main. The skip_pypi input now skips the publish job itself; the GitHub Release job proceeds only after a successful build and either a successful or intentionally skipped publish job. YAML parsing and zizmor pass.
 <!-- SECTION:NOTES:END -->
 
 ## Comments
@@ -70,5 +72,11 @@ author: Human
 created: 2026-08-31 11:20
 ---
 Human: PyPI publishing for v0.1.0 completed, but GitHub Release creation failed because gh could not find a Git repository.
+---
+
+author: Human
+created: 2026-08-31 11:56
+---
+Human: A manual recovery run dispatched from main with skip_pypi was rejected because main is not allowed to deploy to the tag-restricted pypi environment.
 ---
 <!-- COMMENTS:END -->
