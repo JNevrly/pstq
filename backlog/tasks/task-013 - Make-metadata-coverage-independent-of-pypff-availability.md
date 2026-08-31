@@ -1,10 +1,10 @@
 ---
 id: TASK-013
 title: Make metadata coverage independent of pypff availability
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-08-31 09:40'
-updated_date: '2026-08-31 09:44'
+updated_date: '2026-08-31 09:56'
 labels: []
 dependencies: []
 references:
@@ -27,7 +27,7 @@ Fix the CI-only coverage regression where metadata.py is 99% on GitHub runners w
 <!-- AC:BEGIN -->
 - [x] #1 The metadata version helper is covered when pypff exposes a callable version API and when pypff is unavailable or has no callable version API
 - [x] #2 The complete tox suite reaches the configured 100% coverage threshold in an environment without pypff
-- [ ] #3 The CI quality workflow passes on GitHub
+- [x] #3 The CI quality workflow passes on GitHub
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -45,4 +45,22 @@ Fix the CI-only coverage regression where metadata.py is 99% on GitHub runners w
 
 <!-- SECTION:NOTES:BEGIN -->
 Added deterministic tests for callable and non-callable pypff version APIs; the existing test covers import failure. Updated tox to synchronize locked dependencies and run tools in each active tox environment, avoiding devcontainer system site packages. Verified the py313 tox environment cannot import pypff and the complete tox suite passes with 142 tests and 100% coverage. GitHub CI confirmation remains pending.
+
+Human confirmed that the GitHub CI quality workflow passes after the fix was pushed.
 <!-- SECTION:NOTES:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+author: Human
+created: 2026-08-31 09:56
+---
+Human: Confirmed GitHub CI passes and approved closure.
+---
+<!-- COMMENTS:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Made coverage deterministic across pypff availability by testing callable, non-callable, and unavailable version APIs, and by isolating tox environments from system site packages. Verified locally with 142 tests at 100% coverage and the complete tox suite; human confirmed GitHub CI passes.
+<!-- SECTION:FINAL_SUMMARY:END -->
