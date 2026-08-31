@@ -4,7 +4,7 @@ title: Add CI and PyPI release automation
 status: In Progress
 assignee: []
 created_date: '2026-08-31 08:50'
-updated_date: '2026-08-31 09:19'
+updated_date: '2026-08-31 10:10'
 labels: []
 dependencies: []
 references:
@@ -13,6 +13,7 @@ references:
 modified_files:
   - .github/workflows/ci.yml
   - .github/workflows/release.yml
+  - CHANGELOG.md
 priority: high
 type: chore
 ordinal: 19000
@@ -50,6 +51,8 @@ Added SHA-pinned CI and release workflows. CI targets main pushes and pull reque
 Verification: workflow YAML parsed successfully; zizmor reported no findings after disabling release-job dependency caching; git diff --check, uv build, Twine metadata validation, and isolated-wheel CLI smoke test passed. The release-version validation script was exercised locally for v0.1.0; pyproject metadata, pstq.__version__, and the changelog heading matched.
 
 TASK-012 restored the quality baseline: the complete tox suite passes with 141 tests and 100% coverage. Next action: commit the workflows, merge the unrelated GitHub main history into the renamed local main branch, configure the pypi environment and pending Trusted Publisher, then recreate and push v0.1.0.
+
+Updated CHANGELOG.md to record 2026-08-31 as the first public release date for version 0.1.0.
 <!-- SECTION:NOTES:END -->
 
 ## Comments
