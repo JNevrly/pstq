@@ -4,7 +4,7 @@ title: Add CI and PyPI release automation
 status: In Progress
 assignee: []
 created_date: '2026-08-31 08:50'
-updated_date: '2026-08-31 10:10'
+updated_date: '2026-08-31 11:20'
 labels: []
 dependencies: []
 references:
@@ -53,6 +53,8 @@ Verification: workflow YAML parsed successfully; zizmor reported no findings aft
 TASK-012 restored the quality baseline: the complete tox suite passes with 141 tests and 100% coverage. Next action: commit the workflows, merge the unrelated GitHub main history into the renamed local main branch, configure the pypi environment and pending Trusted Publisher, then recreate and push v0.1.0.
 
 Updated CHANGELOG.md to record 2026-08-31 as the first public release date for version 0.1.0.
+
+First release published PyPI version 0.1.0 successfully, but GitHub Release creation failed because the job had no Git checkout for gh release create --verify-tag. Added a pinned checkout of the validated tag to the GitHub Release job. Workflow YAML parsing and zizmor security checks pass. Recovery requires a manual release run for tag v0.1.0 with PyPI skipped.
 <!-- SECTION:NOTES:END -->
 
 ## Comments
@@ -62,5 +64,11 @@ author: Human
 created: 2026-08-31 08:50
 ---
 Human: Use the existing unpublished local v0.1.0 tag for the first public release by recreating it at the final release commit. Include both normal CI and release automation.
+---
+
+author: Human
+created: 2026-08-31 11:20
+---
+Human: PyPI publishing for v0.1.0 completed, but GitHub Release creation failed because gh could not find a Git repository.
 ---
 <!-- COMMENTS:END -->
