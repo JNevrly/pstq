@@ -314,9 +314,7 @@ class PstReader:
         output_path: str | Path,
     ) -> int:
         """Write an attachment through a cached stock-pypff traversal locator."""
-        message = self._message_at_locator(
-            folder_indexes, message_index, message_nid
-        )
+        message = self._message_at_locator(folder_indexes, message_index, message_nid)
         try:
             attachment = message.get_attachment(attachment_index)
             size = attachment.size
@@ -359,9 +357,7 @@ class PstReader:
         message_nid: int,
     ) -> tuple[str | bytes | None, str | None]:
         """Read the preferred source body through a validated traversal locator."""
-        message = self._message_at_locator(
-            folder_indexes, message_index, message_nid
-        )
+        message = self._message_at_locator(folder_indexes, message_index, message_nid)
         for property_name, body_format in (
             ("plain_text_body", "plain"),
             ("html_body", "html"),

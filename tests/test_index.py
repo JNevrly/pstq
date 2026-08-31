@@ -1283,6 +1283,10 @@ def test_get_full_message_rejects_store_and_body_read_failures(
 ) -> None:
     database_path = tmp_path / "index.sqlite"
     index.import_pst("archive.pst", database_path)
+
+    with pytest.raises(ValueError, match="does not belong"):
+        index.get_full_message("archive.pst", database_path, "other:3")
+
     FakeReader.store_uid = "other"
 
     with pytest.raises(index.PstSynchronizationError, match="does not match"):
@@ -1295,6 +1299,23 @@ def test_get_full_message_rejects_store_and_body_read_failures(
         lambda *_: (_ for _ in ()).throw(PstReaderError("body unavailable")),
     )
     with pytest.raises(PstReaderError, match="body unavailable"):
+        index.get_full_message("archive.pst", database_path, "store:3")
+
+
+def test_get_full_message_rejects_a_source_changed_after_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "index.sqlite"
+    index.import_pst("archive.pst", database_path)
+    states = iter(
+        (
+            index._SourceState("archive.pst", 1, 1),
+            index._SourceState("archive.pst", 2, 2),
+        )
+    )
+    monkeypatch.setattr(index, "_source_state", lambda _: next(states))
+
+    with pytest.raises(index.PstSynchronizationError, match="changed during"):
         index.get_full_message("archive.pst", database_path, "store:3")
 
 

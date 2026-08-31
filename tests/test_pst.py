@@ -380,6 +380,44 @@ def test_read_message_body_uses_validated_locator_and_preferred_format(
     assert (rtf_body, rtf_format) == ("RTF body", "rtf")
 
 
+def test_read_message_body_rejects_unavailable_and_invalid_bodies(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "archive.pst"
+    path.touch()
+
+    class NoBodyMessage:
+        identifier = 200
+
+    class UnreadableBodyMessage:
+        identifier = 200
+
+        @property
+        def plain_text_body(self) -> None:
+            raise OSError("unavailable")
+
+    class InvalidBodyMessage:
+        identifier = 200
+        plain_text_body = object()
+
+    pypff_file = FakePypffFile(b"store")
+    pypff_file.root_folder._folders[0]._messages = [NoBodyMessage()]  # type: ignore[list-item]
+    with PstReader(path, pypff_module=FakePypff(pypff_file)) as reader:
+        assert reader.read_message_body((0,), 0, 200) == (None, None)
+
+    pypff_file = FakePypffFile(b"store")
+    pypff_file.root_folder._folders[0]._messages = [UnreadableBodyMessage()]  # type: ignore[list-item]
+    with PstReader(path, pypff_module=FakePypff(pypff_file)) as reader:
+        with pytest.raises(pst.PstReaderError, match="Unable to read plain body"):
+            reader.read_message_body((0,), 0, 200)
+
+    pypff_file = FakePypffFile(b"store")
+    pypff_file.root_folder._folders[0]._messages = [InvalidBodyMessage()]  # type: ignore[list-item]
+    with PstReader(path, pypff_module=FakePypff(pypff_file)) as reader:
+        with pytest.raises(pst.PstReaderError, match="invalid plain body"):
+            reader.read_message_body((0,), 0, 200)
+
+
 def test_attachment_adapter_handles_unavailable_metadata_and_invalid_streams(
     tmp_path: Path,
 ) -> None:
@@ -422,6 +460,10 @@ def test_attachment_extraction_rejects_invalid_locators_and_removes_partial_outp
     with PstReader(path, pypff_module=FakePypff(pypff_file)) as reader:
         with pytest.raises(pst.PstReaderError, match="does not match"):
             reader.extract_attachment((0,), 0, 999, 0, tmp_path / "mismatch")
+        with pytest.raises(pst.PstReaderError, match="Unable to retrieve"):
+            reader.extract_attachment(
+                (0,), 1, message.identifier, 0, tmp_path / "missing"
+            )
         with pytest.raises(pst.PstReaderError, match="ended"):
             reader.extract_attachment((0,), 0, message.identifier, 0, output)
 
@@ -470,6 +512,23 @@ def test_attachment_extraction_rejects_missing_metadata_values(tmp_path: Path) -
     with PstReader(path, pypff_module=FakePypff(pypff_file)) as open_reader:
         with pytest.raises(pst.PstReaderError, match="usable size"):
             open_reader.extract_attachment((0,), 0, 200, 0, tmp_path / "x")
+
+
+def test_attachment_extraction_wraps_attachment_lookup_errors(tmp_path: Path) -> None:
+    path = tmp_path / "archive.pst"
+    path.touch()
+
+    class UnavailableAttachmentMessage:
+        identifier = 200
+
+        def get_attachment(self, _: int) -> None:
+            raise OSError("unavailable")
+
+    pypff_file = FakePypffFile(b"store")
+    pypff_file.root_folder._folders[0]._messages = [UnavailableAttachmentMessage()]  # type: ignore[list-item]
+    with PstReader(path, pypff_module=FakePypff(pypff_file)) as reader:
+        with pytest.raises(pst.PstReaderError, match="Unable to retrieve attachment"):
+            reader.extract_attachment((0,), 0, 200, 0, tmp_path / "attachment")
 
 
 def test_walk_ignores_unavailable_optional_message_properties(tmp_path: Path) -> None:
