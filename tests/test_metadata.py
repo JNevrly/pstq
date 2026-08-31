@@ -339,3 +339,23 @@ def test_libpff_version_is_unknown_when_import_fails(
     monkeypatch.setattr(metadata, "import_module", raise_import_error)
 
     assert metadata._libpff_version() == "unknown"
+
+
+def test_libpff_version_handles_callable_and_missing_version_apis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PypffWithVersion:
+        @staticmethod
+        def get_version() -> str:
+            return "20231205"
+
+    class PypffWithoutCallableVersion:
+        get_version = "not callable"
+
+    monkeypatch.setattr(metadata, "import_module", lambda _: PypffWithVersion)
+    assert metadata._libpff_version() == "20231205"
+
+    monkeypatch.setattr(
+        metadata, "import_module", lambda _: PypffWithoutCallableVersion
+    )
+    assert metadata._libpff_version() == "unknown"
