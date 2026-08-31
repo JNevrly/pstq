@@ -1,10 +1,10 @@
 ---
 id: TASK-011
 title: Add CI and PyPI release automation
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-08-31 08:50'
-updated_date: '2026-08-31 11:56'
+updated_date: '2026-08-31 12:01'
 labels: []
 dependencies: []
 references:
@@ -27,11 +27,11 @@ Add GitHub Actions quality checks and a secure tag-driven release workflow for t
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 CI runs the existing quality suite for pushes and pull requests targeting main
-- [ ] #2 Pushing an exact vX.Y.Z tag validates that it matches the package version and changelog, then builds and validates wheel and source distributions
-- [ ] #3 A separate least-privileged job publishes validated artifacts to PyPI through the pypi GitHub environment using OIDC
-- [ ] #4 A successful PyPI publication creates a GitHub Release with the built distributions attached
-- [ ] #5 Manual recovery for an already-published tag skips the entire PyPI environment job and creates the missing GitHub Release
+- [x] #1 CI runs the existing quality suite for pushes and pull requests targeting main
+- [x] #2 Pushing an exact vX.Y.Z tag validates that it matches the package version and changelog, then builds and validates wheel and source distributions
+- [x] #3 A separate least-privileged job publishes validated artifacts to PyPI through the pypi GitHub environment using OIDC
+- [x] #4 A successful PyPI publication creates a GitHub Release with the built distributions attached
+- [x] #5 Manual recovery for an already-published tag skips the entire PyPI environment job and creates the missing GitHub Release
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -46,17 +46,11 @@ Add GitHub Actions quality checks and a secure tag-driven release workflow for t
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Added SHA-pinned CI and release workflows. CI targets main pushes and pull requests. Release validates exact vX.Y.Z tags, pyproject and module versions, and the changelog before quality checks, build, metadata validation, isolated-wheel smoke test, OIDC PyPI publication, and GitHub Release creation.
+Implemented SHA-pinned CI and tag-driven release workflows. Releases validate the exact vX.Y.Z tag against pyproject metadata, pstq.__version__, and CHANGELOG.md; run quality and distribution checks; publish with PyPI Trusted Publishing; and attach the validated artifacts to a generated GitHub Release.
 
-Verification: workflow YAML parsed successfully; zizmor reported no findings after disabling release-job dependency caching; git diff --check, uv build, Twine metadata validation, and isolated-wheel CLI smoke test passed. The release-version validation script was exercised locally for v0.1.0; pyproject metadata, pstq.__version__, and the changelog heading matched.
+Recovery hardening: the GitHub Release job checks out the validated tag before gh release create --verify-tag. Manual recovery with skip_pypi skips the entire pypi-environment job and permits GitHub Release creation only after the build succeeds and publishing either succeeds or is intentionally skipped.
 
-TASK-012 restored the quality baseline: the complete tox suite passes with 141 tests and 100% coverage. Next action: commit the workflows, merge the unrelated GitHub main history into the renamed local main branch, configure the pypi environment and pending Trusted Publisher, then recreate and push v0.1.0.
-
-Updated CHANGELOG.md to record 2026-08-31 as the first public release date for version 0.1.0.
-
-First release published PyPI version 0.1.0 successfully, but GitHub Release creation failed because the job had no Git checkout for gh release create --verify-tag. Added a pinned checkout of the validated tag to the GitHub Release job. Workflow YAML parsing and zizmor security checks pass. Recovery requires a manual release run for tag v0.1.0 with PyPI skipped.
-
-Manual recovery initially entered the pypi environment even with publishing skipped, so tag-only environment rules rejected a run dispatched from main. The skip_pypi input now skips the publish job itself; the GitHub Release job proceeds only after a successful build and either a successful or intentionally skipped publish job. YAML parsing and zizmor pass.
+Verification: workflow YAML parsing and zizmor security checks passed. GitHub CI run 33389451287 passed. The successful release workflow run 33389514702 recovered v0.1.0 without re-publishing. PyPI and the GitHub Release both expose the wheel and source distribution with matching SHA-256 hashes.
 <!-- SECTION:NOTES:END -->
 
 ## Comments
@@ -79,4 +73,16 @@ created: 2026-08-31 11:56
 ---
 Human: A manual recovery run dispatched from main with skip_pypi was rejected because main is not allowed to deploy to the tag-restricted pypi environment.
 ---
+
+author: Human
+created: 2026-08-31 12:01
+---
+Human: The corrected manual recovery workflow completed successfully and the release is confirmed; close this task.
+---
 <!-- COMMENTS:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Added secure CI and PyPI release automation, then published pstq 0.1.0. Verified successful GitHub CI, PyPI Trusted Publishing, GitHub Release creation with wheel and sdist assets, and the manual recovery path for an already-published tag. No ADRs or follow-up tasks were created.
+<!-- SECTION:FINAL_SUMMARY:END -->
