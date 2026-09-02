@@ -763,8 +763,52 @@ def test_unified_search_orders_and_filters_recovered_results(
     } == {"Alpha", "Beta"}
     with pytest.raises(ValueError, match="must not be empty"):
         index.search_messages(database_path, " ")
+    with pytest.raises(ValueError, match="requires QUERY or at least one"):
+        index.search_messages(database_path, None)
     with pytest.raises(ValueError, match="Invalid FTS query"):
         index.search_messages(database_path, '"')
+
+
+def test_filter_only_searches_apply_structured_filters_in_date_order(
+    tmp_path: Path,
+) -> None:
+    first = replace(
+        _message(),
+        delivery_time=datetime(2026, 8, 20, 12, 30),
+        transport_headers="To: Recipient <recipient@example.test>\n",
+    )
+    second = replace(
+        _message(nid=4),
+        delivery_time=datetime(2026, 8, 21, 12, 30),
+        index_in_folder=1,
+        transport_headers="To: Recipient <recipient@example.test>\n",
+    )
+    FakeReader.folders = _records(first, second)
+    database_path = tmp_path / "index.sqlite"
+    index.import_pst("archive.pst", database_path)
+
+    results = index.search_messages(
+        database_path,
+        None,
+        sender="sender",
+        recipient="recipient@example.test",
+        after="2026-08-20T00:00:00",
+        before="2026-08-22T00:00:00",
+        folder="Root/Inbox",
+        has_attachment=True,
+    )
+
+    assert [result.id for result in results] == ["store:4", "store:3"]
+    assert [(result.score, result.snippet) for result in results] == [
+        (0.0, ""),
+        (0.0, ""),
+    ]
+    assert [
+        result.id
+        for result in index.search_messages(
+            database_path, None, sender_aliases=("Sender",)
+        )
+    ] == ["store:4", "store:3"]
 
 
 def test_incremental_sync_removes_recovered_search_documents(

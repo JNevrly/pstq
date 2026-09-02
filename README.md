@@ -91,6 +91,7 @@ They deliberately omit message bodies.
 
 ```console
 $ pstq --config pstq.yaml search 'Capon calibration' --json
+$ pstq --config pstq.yaml search --from 'Sender' --after 2025-01-01 --json
 $ pstq --config pstq.yaml search invoice \
     --from-owner \
     --to accounting@example.com \
@@ -103,7 +104,10 @@ $ pstq --config pstq.yaml search invoice \
 ```
 
 Search supports FTS5 query syntax. Quote punctuation-heavy or exact phrases,
-and prefer the `--to` filter for recipient email addresses.
+and prefer the `--to` filter for recipient email addresses. QUERY may be omitted
+when one or more filters are supplied. Filter-only results are ordered by date
+descending and then stable message ID, with undated messages last; their
+`score` is `0.0` and `snippet` is empty.
 
 Each result has a stable `id`. Search JSON includes `id`, `date`, `from`, `to`,
 `subject`, `folder`, `snippet`, and `score`. Pass the selected ID to `show` to
@@ -137,7 +141,7 @@ be an IANA timezone and is applied to quoted timestamps that omit an offset.
 | --- | --- |
 | `status [--json]` | Report source and cache metadata plus freshness. |
 | `folders [--json]` | List indexed folder paths and stable IDs. |
-| `search QUERY [filters] [--json]` | Synchronize when needed, then run a bounded FTS5 search. |
+| `search [QUERY] [filters] [--json]` | Synchronize when needed, then run a bounded FTS5 or filter-only search. |
 | `show MESSAGE_ID [--full] [--json]` | Retrieve cleaned content from SQLite, or use `--full` to read the current source body. |
 | `thread MESSAGE_ID [--json]` | Reconstruct a related-message view from persisted cache data. |
 | `attachments MESSAGE_ID [--json]` | List persisted attachment metadata from SQLite. |

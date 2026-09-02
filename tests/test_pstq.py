@@ -371,6 +371,47 @@ def test_search_command_synchronizes_and_returns_lightweight_json(
     ]
 
 
+def test_search_command_accepts_filter_only_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(cli, "sync_pst", lambda *_: None)
+    monkeypatch.setattr(
+        cli,
+        "search_messages",
+        lambda *args, **kwargs: calls.append(args) or [],
+    )
+
+    result = CliRunner().invoke(
+        cli.main,
+        ["--config", str(_archive_config(tmp_path)), "search", "--from", "Sender"],
+    )
+
+    assert result.exit_code == 0
+    assert calls[0][1] is None
+
+
+def test_search_command_rejects_requests_without_query_or_filters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    synchronized: list[tuple[object, ...]] = []
+    monkeypatch.setattr(cli, "sync_pst", lambda *args: synchronized.append(args))
+
+    result = CliRunner().invoke(
+        cli.main,
+        ["--config", str(_archive_config(tmp_path)), "search", "--json"],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.output) == {
+        "error": {
+            "code": "invalid_request",
+            "message": "Search requires QUERY or at least one structured filter.",
+        }
+    }
+    assert synchronized == []
+
+
 def test_search_passes_owner_history_settings_to_synchronization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -415,7 +456,7 @@ def test_search_from_owner_expands_aliases_and_validates_configuration(
     runner = CliRunner()
 
     result = runner.invoke(
-        cli.main, ["--config", str(config_path), "search", "x", "--from-owner"]
+        cli.main, ["--config", str(config_path), "search", "--from-owner"]
     )
     conflict = runner.invoke(
         cli.main,

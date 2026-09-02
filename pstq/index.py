@@ -304,7 +304,7 @@ def list_folders(database_path: str | Path) -> list[dict[str, object]]:
 
 def search_messages(
     database_path: str | Path,
-    query: str,
+    query: str | None,
     *,
     sender: str | None = None,
     sender_aliases: Sequence[str] = (),
@@ -316,15 +316,20 @@ def search_messages(
     limit: int = 20,
 ) -> list[SearchResult]:
     """Search native and recovered messages with FTS5 and structured filters."""
-    if not query.strip():
+    if query is not None and not query.strip():
         raise ValueError("Search query must not be empty.")
+    aliases = tuple(alias for alias in sender_aliases if alias.strip())
+    if query is None and not any(
+        (sender, aliases, recipient, after, before, folder, has_attachment)
+    ):
+        raise ValueError("Search requires QUERY or at least one structured filter.")
+
     state = _require_index_state(database_path)
-    filters = ["search_fts MATCH ?", "search_document.store_uid = ?"]
-    parameters: list[object] = [query, state.store_uid]
+    filters = ["search_document.store_uid = ?"]
+    parameters: list[object] = [state.store_uid]
     if sender:
         filters.append("search_document.sender LIKE ? COLLATE NOCASE")
         parameters.append(f"%{sender}%")
-    aliases = tuple(alias for alias in sender_aliases if alias.strip())
     if aliases:
         filters.append(
             "("
@@ -349,17 +354,31 @@ def search_messages(
     if has_attachment:
         filters.append("search_document.has_attachment = 1")
 
-    statement = f"""
-        SELECT search_document.selector, search_document.subject,
-               search_document.sender, search_document.date,
-               search_document.folder_path, search_document.recipients_json,
-               snippet(search_fts, -1, '', '', '...', 20), -bm25(search_fts)
-        FROM search_fts
-        JOIN search_document ON search_document.rowid = search_fts.rowid
-        WHERE {" AND ".join(filters)}
-        ORDER BY bm25(search_fts), search_document.selector
-        LIMIT ?
-    """
+    if query is None:
+        statement = f"""
+            SELECT search_document.selector, search_document.subject,
+                   search_document.sender, search_document.date,
+                   search_document.folder_path, search_document.recipients_json,
+                   '', 0.0
+            FROM search_document
+            WHERE {" AND ".join(filters)}
+            ORDER BY search_document.date DESC, search_document.selector
+            LIMIT ?
+        """
+    else:
+        filters.insert(0, "search_fts MATCH ?")
+        parameters.insert(0, query)
+        statement = f"""
+            SELECT search_document.selector, search_document.subject,
+                   search_document.sender, search_document.date,
+                   search_document.folder_path, search_document.recipients_json,
+                   snippet(search_fts, -1, '', '', '...', 20), -bm25(search_fts)
+            FROM search_fts
+            JOIN search_document ON search_document.rowid = search_fts.rowid
+            WHERE {" AND ".join(filters)}
+            ORDER BY bm25(search_fts), search_document.selector
+            LIMIT ?
+        """
     parameters.append(limit)
     try:
         with sqlite3.connect(database_path) as connection:

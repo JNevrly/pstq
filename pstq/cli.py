@@ -356,7 +356,7 @@ def folders(ctx: click.Context, json_output: bool) -> None:
 
 
 @main.command()
-@click.argument("query")
+@click.argument("query", required=False)
 @click.option("--from", "sender", help="Match the sender name.")
 @click.option(
     "--from-owner",
@@ -385,7 +385,7 @@ def folders(ctx: click.Context, json_output: bool) -> None:
 @click.pass_context
 def search(
     ctx: click.Context,
-    query: str,
+    query: str | None,
     sender: str | None,
     from_owner: bool,
     recipient: str | None,
@@ -398,21 +398,31 @@ def search(
 ) -> None:
     """Synchronize when needed, then run a bounded FTS5 search.
 
-    QUERY uses SQLite FTS5 syntax and must not be empty. --from and --to match
-    sender and persisted recipient text. --from-owner matches any configured
-    owner alias and cannot be combined with --from. --after is inclusive and
-    --before is exclusive ISO-8601 timestamp filtering; --folder is an exact
-    cached path; --has-attachment requires attachment_count > 0. --limit
-    defaults to 20 and accepts 1 through 100. search compares source path, size,
-    and mtime before querying, then atomically synchronizes if the cache is stale.
+    QUERY uses SQLite FTS5 syntax and must not be empty. Omit QUERY only when
+    supplying one or more filters. --from and --to match sender and persisted
+    recipient text. --from-owner matches any configured owner alias and cannot
+    be combined with --from. --after is inclusive and --before is exclusive
+    ISO-8601 timestamp filtering; --folder is an exact cached path;
+    --has-attachment requires attachment_count > 0. --limit defaults to 20 and
+    accepts 1 through 100. search compares source path, size, and mtime before
+    querying, then atomically synchronizes if the cache is stale.
 
-    --json returns at most limit lightweight records, ordered by FTS score then
-    stable message ID: [{date, folder, from, id, score, snippet, subject, to}].
-    id is a stable selector for show, thread, and attachments. Bodies are
-    intentionally omitted; call show only for relevant candidates.
+    --json returns at most limit lightweight records. Text-query results are
+    ordered by FTS score then stable message ID. Filter-only results are ordered
+    by date descending, then stable message ID, with undated messages last; their
+    score is 0.0 and snippet is empty: [{date, folder, from, id, score, snippet,
+    subject, to}]. id is a stable selector for show, thread, and attachments.
+    Bodies are intentionally omitted; call show only for relevant candidates.
     """
     source_path, database_path = _configured_paths(ctx)
     try:
+        if query is None and not any(
+            (sender, from_owner, recipient, after, before, folder, has_attachment)
+        ):
+            raise CliContractError(
+                "Search requires QUERY or at least one structured filter.",
+                "invalid_request",
+            )
         history = _history_settings(ctx)
         if from_owner and sender:
             raise CliContractError(
