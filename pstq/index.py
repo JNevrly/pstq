@@ -314,10 +314,13 @@ def search_messages(
     folder: str | None = None,
     has_attachment: bool = False,
     limit: int = 20,
+    offset: int = 0,
 ) -> list[SearchResult]:
     """Search native and recovered messages with FTS5 and structured filters."""
     if query is not None and not query.strip():
         raise ValueError("Search query must not be empty.")
+    if offset < 0:
+        raise ValueError("Search offset must be zero or greater.")
     aliases = tuple(alias for alias in sender_aliases if alias.strip())
     if query is None and not any(
         (sender, aliases, recipient, after, before, folder, has_attachment)
@@ -363,7 +366,7 @@ def search_messages(
             FROM search_document
             WHERE {" AND ".join(filters)}
             ORDER BY search_document.date DESC, search_document.selector
-            LIMIT ?
+            LIMIT ? OFFSET ?
         """
     else:
         filters.insert(0, "search_fts MATCH ?")
@@ -377,9 +380,10 @@ def search_messages(
             JOIN search_document ON search_document.rowid = search_fts.rowid
             WHERE {" AND ".join(filters)}
             ORDER BY bm25(search_fts), search_document.selector
-            LIMIT ?
+            LIMIT ? OFFSET ?
         """
     parameters.append(limit)
+    parameters.append(offset)
     try:
         with sqlite3.connect(database_path) as connection:
             connection.text_factory = _decode_sqlite_text

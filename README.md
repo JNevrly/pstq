@@ -92,6 +92,7 @@ They deliberately omit message bodies.
 ```console
 $ pstq --config pstq.yaml search 'Capon calibration' --json
 $ pstq --config pstq.yaml search --from 'Sender' --after 2025-01-01 --json
+$ pstq --config pstq.yaml search 'Capon calibration' --limit 20 --offset 20 --json
 $ pstq --config pstq.yaml search invoice \
     --from-owner \
     --to accounting@example.com \
@@ -108,6 +109,13 @@ and prefer the `--to` filter for recipient email addresses. QUERY may be omitted
 when one or more filters are supplied. Filter-only results are ordered by date
 descending and then stable message ID, with undated messages last; their
 `score` is `0.0` and `snippet` is empty.
+
+Use `--offset` to request later bounded pages. It is zero-based and defaults to
+`0`; retain the same query and filters, then increase it by the page `--limit`
+(for example, `--limit 20 --offset 20` requests the second page). Each JSON
+response remains an array of at most 100 records; a response shorter than the
+requested limit is the final page. The source and cache must remain unchanged
+while traversing pages to preserve a stable result set.
 
 Each result has a stable `id`. Search JSON includes `id`, `date`, `from`, `to`,
 `subject`, `folder`, `snippet`, and `score`. Pass the selected ID to `show` to
@@ -148,7 +156,7 @@ be an IANA timezone and is applied to quoted timestamps that omit an offset.
 | `attachment ATTACHMENT_ID --output FILE` | Synchronize if needed, then extract one original attachment through its cached PST locator. `--output` must name a path that does not exist; PSTQ never overwrites an existing file. |
 
 `search` filters are `--from`, `--to`, `--after`, `--before`, `--folder`,
-`--has-attachment`, `--from-owner`, and `--limit`. The full agent contract,
+`--has-attachment`, `--from-owner`, `--limit`, and `--offset`. The full agent contract,
 including JSON schemas, stable ID formats, error envelopes, cache access,
 limits, and known libpff limitations, is maintained in the CLI itself. Read it
 before invoking a command:

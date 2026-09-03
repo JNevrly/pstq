@@ -376,6 +376,13 @@ def folders(ctx: click.Context, json_output: bool) -> None:
     help="Maximum results.",
 )
 @click.option(
+    "--offset",
+    type=click.IntRange(min=0),
+    default=0,
+    show_default=True,
+    help="Zero-based number of matching results to skip.",
+)
+@click.option(
     "--json",
     "json_output",
     is_flag=True,
@@ -394,6 +401,7 @@ def search(
     folder: str | None,
     has_attachment: bool,
     limit: int,
+    offset: int,
     json_output: bool,
 ) -> None:
     """Synchronize when needed, then run a bounded FTS5 search.
@@ -413,6 +421,9 @@ def search(
     score is 0.0 and snippet is empty: [{date, folder, from, id, score, snippet,
     subject, to}]. id is a stable selector for show, thread, and attachments.
     Bodies are intentionally omitted; call show only for relevant candidates.
+    --offset defaults to 0 and skips that many matching results. Retain the same
+    request and increase offset by limit to retrieve later pages; a JSON page
+    shorter than limit is final.
     """
     source_path, database_path = _configured_paths(ctx)
     try:
@@ -449,6 +460,7 @@ def search(
             folder=folder,
             has_attachment=has_attachment,
             limit=limit,
+            offset=offset,
         )
     except (OSError, PstReaderError, PstSynchronizationError, ValueError) as error:
         raise _command_error(error) from error

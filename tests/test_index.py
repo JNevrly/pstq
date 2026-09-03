@@ -727,6 +727,10 @@ def test_unified_search_orders_and_filters_recovered_results(
 
     assert results == index.search_messages(database_path, "Common")
     assert index.search_messages(database_path, "Common", limit=1) == results[:1]
+    assert (
+        index.search_messages(database_path, "Common", limit=1, offset=1)
+        == results[1:2]
+    )
     assert len(results) == 3
     assert {result.subject for result in results} == {"Status update", "Alpha", "Beta"}
     by_subject = {result.subject: result for result in results}
@@ -763,6 +767,8 @@ def test_unified_search_orders_and_filters_recovered_results(
     } == {"Alpha", "Beta"}
     with pytest.raises(ValueError, match="must not be empty"):
         index.search_messages(database_path, " ")
+    with pytest.raises(ValueError, match="offset must be zero"):
+        index.search_messages(database_path, "Common", offset=-1)
     with pytest.raises(ValueError, match="requires QUERY or at least one"):
         index.search_messages(database_path, None)
     with pytest.raises(ValueError, match="Invalid FTS query"):
@@ -809,6 +815,59 @@ def test_filter_only_searches_apply_structured_filters_in_date_order(
             database_path, None, sender_aliases=("Sender",)
         )
     ] == ["store:4", "store:3"]
+
+
+def test_search_messages_paginates_full_text_and_filter_only_results(
+    tmp_path: Path,
+) -> None:
+    messages = tuple(
+        replace(
+            _message(nid=nid, plain_text_body="Pagination result"),
+            delivery_time=datetime(2026, 8, 20, 12),
+            index_in_folder=nid,
+        )
+        for nid in range(10, 15)
+    )
+    FakeReader.folders = _records(*messages)
+    database_path = tmp_path / "index.sqlite"
+    index.import_pst("archive.pst", database_path)
+
+    full_text = index.search_messages(database_path, "Pagination", limit=20)
+    full_text_pages = [
+        index.search_messages(database_path, "Pagination", limit=2, offset=offset)
+        for offset in (0, 2, 4)
+    ]
+    filter_only = index.search_messages(database_path, None, sender="Sender", limit=20)
+    filter_only_pages = [
+        index.search_messages(
+            database_path, None, sender="Sender", limit=2, offset=offset
+        )
+        for offset in (0, 2, 4)
+    ]
+
+    assert [result.id for page in full_text_pages for result in page] == [
+        result.id for result in full_text
+    ]
+    assert [result.id for page in filter_only_pages for result in page] == [
+        result.id for result in filter_only
+    ]
+    assert [result.id for result in full_text] == [
+        "store:10",
+        "store:11",
+        "store:12",
+        "store:13",
+        "store:14",
+    ]
+    assert [result.id for result in filter_only] == [
+        "store:10",
+        "store:11",
+        "store:12",
+        "store:13",
+        "store:14",
+    ]
+    assert [len(page) for page in full_text_pages] == [2, 2, 1]
+    assert [len(page) for page in filter_only_pages] == [2, 2, 1]
+    assert full_text == index.search_messages(database_path, "Pagination", limit=20)
 
 
 def test_incremental_sync_removes_recovered_search_documents(

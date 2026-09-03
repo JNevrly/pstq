@@ -41,6 +41,7 @@ def test_command_line_interface():
     assert "snapshot" in result.output
     assert "PSTQ_ARCHIVE__PST_PATH" in result.output
     assert "STORE_UID:NID" in result.output
+    assert "--offset" in runner.invoke(cli.main, ["search", "--help"]).output
 
     for command in (
         "status",
@@ -389,6 +390,29 @@ def test_search_command_accepts_filter_only_requests(
 
     assert result.exit_code == 0
     assert calls[0][1] is None
+
+
+def test_search_command_passes_offset_and_rejects_negative_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(cli, "sync_pst", lambda *_: None)
+    monkeypatch.setattr(
+        cli,
+        "search_messages",
+        lambda *_args, **kwargs: calls.append(kwargs) or [],
+    )
+    config = ["--config", str(_archive_config(tmp_path)), "search", "Capon"]
+    runner = CliRunner()
+
+    page = runner.invoke(cli.main, [*config, "--limit", "2", "--offset", "2"])
+    invalid = runner.invoke(cli.main, [*config, "--offset", "-1", "--json"])
+
+    assert page.exit_code == 0
+    assert calls[0]["limit"] == 2
+    assert calls[0]["offset"] == 2
+    assert invalid.exit_code == 2
+    assert json.loads(invalid.output)["error"]["code"] == "invalid_request"
 
 
 def test_search_command_rejects_requests_without_query_or_filters(
